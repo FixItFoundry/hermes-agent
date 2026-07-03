@@ -1285,8 +1285,12 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         save_jobs(jobs)
                         return
                 
-                # Compute next run
-                job["next_run_at"] = compute_next_run(job["schedule"], now)
+                # Compute next run safely
+                schedule = job.get("schedule")
+                if schedule:
+                    job["next_run_at"] = compute_next_run(schedule, now)
+                else:
+                    job["next_run_at"] = None
 
                 # If no next run, decide whether this is terminal completion
                 # (one-shot) or a transient failure (recurring schedule couldn't
@@ -1295,7 +1299,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 # missing runtime dep into "job completed" and the user's
                 # schedule quietly goes off. See issue #16265.
                 if job["next_run_at"] is None:
-                    kind = job.get("schedule", {}).get("kind")
+                    # Use a fallback empty dict if schedule is missing/None
+                    kind = job.get("schedule") or {}
+                    kind = kind.get("kind") if isinstance(kind, dict) else None
+                    
                     if kind in {"cron", "interval"}:
                         job["state"] = "error"
                         if not job.get("last_error"):
@@ -1312,6 +1319,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                             kind,
                         )
                     else:
+                        # This safely disables ad-hoc/one-shot jobs that have no schedule
                         job["enabled"] = False
                         job["state"] = "completed"
                 elif job.get("state") != "paused":

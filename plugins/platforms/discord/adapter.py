@@ -674,34 +674,41 @@ class VoiceReceiver:
     @staticmethod
     def pcm_to_wav(pcm_data: bytes, output_path: str,
                    src_rate: int = 48000, src_channels: int = 2):
-        """Convert raw PCM to 16kHz mono WAV via ffmpeg."""
-        with tempfile.NamedTemporaryFile(suffix=".pcm", delete=False) as f:
-            f.write(pcm_data)
-            pcm_path = f.name
-        try:
-            from hermes_cli._subprocess_compat import windows_hide_flags
+        """Convert raw PCM to 16kHz mono WAV via ffmpeg with noise suppression."""
+        from hermes_cli._subprocess_compat import windows_hide_flags
 
-            subprocess.run(
-                [
-                    "ffmpeg", "-y", "-loglevel", "error",
-                    "-f", "s16le",
-                    "-ar", str(src_rate),
-                    "-ac", str(src_channels),
-                    "-i", pcm_path,
-                    "-ar", "16000",
-                    "-ac", "1",
-                    output_path,
-                ],
+        # Pipe PCM directly to ffmpeg stdin, capture WAV to stdout
+        # Discord applies Krisp noise suppression client-side, so no extra filters needed
+        ffmpeg_cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "s16le",
+            "-ar", str(src_rate),
+            "-ac", str(src_channels),
+            "-i", "pipe:0",  # Read from stdin
+            "-ar", "16000",
+            "-ac", "1",
+            "-f", "wav",  # Output as WAV
+            "pipe:1",  # Write to stdout
+        ]
+
+        try:
+            result = subprocess.run(
+                ffmpeg_cmd,
+                input=pcm_data,
+                capture_output=True,
                 check=True,
                 timeout=10,
-                stdin=subprocess.DEVNULL,
                 creationflags=windows_hide_flags(),
             )
-        finally:
-            try:
-                os.unlink(pcm_path)
-            except OSError:
-                pass
+            # Write the WAV data to the output path
+            with open(output_path, "wb") as f:
+                f.write(result.stdout)
+        except subprocess.TimeoutExpired:
+            logger.warning("ffmpeg PCM→WAV conversion timed out")
+            raise
+        except subprocess.CalledProcessError as e:
+            logger.error("ffmpeg PCM→WAV conversion failed: %s", e.stderr.decode() if e.stderr else str(e))
+            raise
 
 
 def _read_dm_role_auth_guild() -> Optional[int]:

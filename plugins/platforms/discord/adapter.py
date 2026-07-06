@@ -1207,6 +1207,15 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._cancel_bot_task()
             self._release_platform_lock()
             return False
+        except discord.LoginFailure as e:
+            # Bad token or other auth failure — non-retryable.
+            # Signal the gateway supervisor so the reconnect watcher drops
+            # this platform from the retry queue instead of looping forever.
+            logger.error("[%s] Discord authentication failed: %s", self.name, e)
+            self._set_fatal_error("discord_auth_failed", str(e), retryable=False)
+            await self._cancel_bot_task()
+            self._release_platform_lock()
+            return False
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to connect to Discord: %s", self.name, e, exc_info=True)
             # Same zombie-client hazard as the timeout branch: the background

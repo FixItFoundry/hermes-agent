@@ -4198,7 +4198,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if not allowed:
                 return []
             try:
-                entries = self._model_autocomplete_entries()
+                entries = await asyncio.to_thread(self._model_autocomplete_entries)
             except Exception:
                 return []
             q = (current or "").strip().lower()

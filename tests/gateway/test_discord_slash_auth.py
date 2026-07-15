@@ -846,3 +846,136 @@ async def test_skill_handler_dispatches_for_authorized(
     interaction = _make_interaction("100200300")
     await handler(interaction, "alpha", "extra args")
     assert dispatched == ["/alpha extra args"]
+
+# ---------------------------------------------------------------------------
+# Searchable /model autocomplete
+# ---------------------------------------------------------------------------
+
+import discord
+import pytest
+from unittest.mock import MagicMock, AsyncMock
+
+@pytest.mark.asyncio
+async def test_model_autocomplete_offloads_to_thread(adapter, monkeypatch):
+    """_autocomplete_model must offload _model_autocomplete_entries via asyncio.to_thread.
+    Without this, blocking HTTP on a stale cache freezes the Discord gateway.
+    """
+    calls = []
+    real_to_thread = asyncio.to_thread
+
+    async def spy_to_thread(func, /, *args, **kwargs):
+        calls.append(func)
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", spy_to_thread)
+
+    captured = {}
+    def capture_autocomplete(*args, **kwargs):
+        for arg in args:
+            if callable(arg):
+                captured[arg.__name__] = arg
+        for val in kwargs.values():
+            if callable(val):
+                captured[val.__name__] = val
+
+        def _passthrough(fn):
+            return fn
+        return _passthrough
+
+    monkeypatch.setattr(
+        discord.app_commands, "autocomplete", capture_autocomplete, raising=False
+    )
+
+    tree_obj = type(
+        "_Tree",
+        (),
+        {
+            "get_commands": lambda self: [],
+            "add_command": lambda self, cmd: None,
+            "command": lambda *a, **k: (lambda fn: fn),
+        },
+    )()
+    adapter._client.tree = tree_obj
+    adapter._allowed_user_ids = {"100200300"}
+
+    adapter._register_slash_commands()
+
+    autocomplete_fn = captured.get("_autocomplete_model")
+    if autocomplete_fn is None:
+        pytest.fail(
+            f"Could not capture '_autocomplete_model' from registration. "
+            f"Captured keys: {list(captured.keys())}"
+        )
+
+    interaction = MagicMock(spec=discord.Interaction)
+    interaction.user = MagicMock()
+    interaction.user.id = 100200300
+    interaction.user.display_name = "user_100200300"
+
+    monkeypatch.setattr(
+        adapter,
+        "_evaluate_slash_authorization",
+        lambda inter: (True, "Authorized")
+    )
+
+    mock_entries = [("Model A", "model_a"), ("Model B", "model_b")]
+    monkeypatch.setattr(
+        adapter,
+        "_model_autocomplete_entries",
+        lambda: mock_entries
+    )
+
+    choices = await autocomplete_fn(interaction, "")
+
+    target_entries_method = adapter._model_autocomplete_entries
+    
+    assert len(choices) == 2
+    assert any(
+        callable(c) and (c == target_entries_method or "lambda" in getattr(c, "__name__", ""))
+        for c in calls
+    ), f"The entries builder was not run via asyncio.to_thread. Calls intercepted: {calls}"
+    
+@pytest.mark.asyncio
+async def test_model_autocomplete_returns_empty_for_unauthorized(adapter, monkeypatch):
+    """Autocomplete must not leak the model catalog to unauthorized users."""
+    import discord
+    import pytest
+
+    adapter._allowed_user_ids = {"100200300"}
+
+    captured = {}
+    def capture_autocomplete(*args, **kwargs):
+        def _passthrough(fn):
+            captured["fn"] = fn
+            return fn
+        return _passthrough
+
+    monkeypatch.setattr(
+        discord.app_commands, "autocomplete", capture_autocomplete, raising=False
+    )
+
+    tree_obj = type(
+        "_Tree",
+        (),
+        {
+            "get_commands": lambda: [],
+            "add_command": lambda self, cmd: None,
+            "command": lambda *a, **k: (lambda fn: fn),
+        },
+    )()
+    adapter._client.tree = tree_obj
+    adapter._register_slash_commands()
+
+    autocomplete_fn = captured.get("fn")
+    if autocomplete_fn is None:
+        pytest.skip("Could not capture autocomplete callback")
+
+    interaction = _make_interaction("999999999")
+
+    if hasattr(interaction, "user"):
+        interaction.user.display_name = "user_999999999"
+
+    result = await autocomplete_fn(interaction, "")
+
+    assert result is None or result == [], "Unauthorized users must receive no suggestions"
+

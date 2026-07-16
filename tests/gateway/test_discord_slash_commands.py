@@ -16,6 +16,7 @@ def _ensure_discord_mock():
 
     if sys.modules.get("discord") is None:
         discord_mod = MagicMock()
+        discord_mod.LoginFailure = Exception
         discord_mod.Intents.default.return_value = MagicMock()
         discord_mod.DMChannel = type("DMChannel", (), {})
         discord_mod.Thread = type("Thread", (), {})
@@ -71,6 +72,8 @@ def _ensure_discord_mock():
             _app.autocomplete = lambda **kwargs: (lambda fn: fn)
         except Exception:
             pass
+    if not hasattr(sys.modules["discord"], "LoginFailure"):
+        sys.modules["discord"].LoginFailure = Exception
 
 
 _ensure_discord_mock()

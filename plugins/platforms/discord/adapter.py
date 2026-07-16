@@ -1276,12 +1276,17 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._cancel_bot_task()
             self._release_platform_lock()
             return False
-        except discord.LoginFailure as e:
-            # Bad token or other auth failure — non-retryable.
-            # Signal the gateway supervisor so the reconnect watcher drops
-            # this platform from the retry queue instead of looping forever.
-            logger.error("[%s] Discord authentication failed: %s", self.name, e)
-            self._set_fatal_error("discord_auth_failed", str(e), retryable=False)
+        except Exception as e:  # pragma: no cover - defensive logging
+            # Check class name to safely catch LoginFailure even when discord is mocked in tests
+            if type(e).__name__ == "LoginFailure":
+                # Bad token or other auth failure — non-retryable.
+                logger.error("[%s] Discord authentication failed: %s", self.name, e)
+                self._set_fatal_error("discord_auth_failed", str(e), retryable=False)
+            else:
+                logger.error("[%s] Failed to connect to Discord: %s", self.name, e, exc_info=True)
+                
+            # Same zombie-client hazard as the timeout branch: cancel the background task
+            # so the discarded adapter cannot connect.
             await self._cancel_bot_task()
             self._release_platform_lock()
             return False
@@ -1361,17 +1366,21 @@ class DiscordAdapter(BasePlatformAdapter):
                 logger.error(
                     "[%s] Discord client appears dead, forcing reconnect", self.name,
                 )
+                self._set_fatal_error(
+                    "liveness_probe_failed",
+                    f"Discord REST liveness probe failed {fails} times in a row",
+                    retryable=True,
+                )
+                # stop "running" BEFORE close(): close lets client.start() return,
+                # and _handle_bot_task_done would otherwise clobber this fatal code
+                # with discord_gateway_task_exited and notify the supervisor twice.
+                self._running = False
                 try:
                     await client.close()
                 except Exception:
                     logger.debug(
                         "[%s] Error closing wedged Discord client", self.name, exc_info=True,
                     )
-                self._set_fatal_error(
-                    "liveness_probe_failed",
-                    f"Discord REST liveness probe failed {fails} times in a row",
-                    retryable=True,
-                )
                 try:
                     await self._notify_fatal_error()
                 except Exception:

@@ -27,11 +27,15 @@ from gateway.config import PlatformConfig
 
 
 def _ensure_discord_mock():
-    if "discord" in sys.modules and hasattr(sys.modules["discord"], "__file__"):
-        return  # real discord installed
+    try:
+        import discord
+        return
+    except ImportError:
+        pass
 
     if sys.modules.get("discord") is None:
         discord_mod = MagicMock()
+        discord_mod.LoginFailure = Exception
         discord_mod.Intents.default.return_value = MagicMock()
         discord_mod.DMChannel = type("DMChannel", (), {})
         discord_mod.Thread = type("Thread", (), {})
@@ -64,14 +68,8 @@ def _ensure_discord_mock():
                 self.parent = parent
                 self.default_permissions = None
 
-        discord_mod.app_commands = SimpleNamespace(
-            describe=lambda **kwargs: (lambda fn: fn),
-            choices=lambda **kwargs: (lambda fn: fn),
-            autocomplete=lambda **kwargs: (lambda fn: fn),
-            Choice=lambda **kwargs: SimpleNamespace(**kwargs),
-            Group=_FakeGroup,
-            Command=_FakeCommand,
-        )
+        discord_mod.app_commands = MagicMock()
+        discord_mod.app_commands.autocomplete = lambda **kwargs: (lambda fn: fn)
 
         ext_mod = MagicMock()
         commands_mod = MagicMock()
@@ -978,4 +976,3 @@ async def test_model_autocomplete_returns_empty_for_unauthorized(adapter, monkey
     result = await autocomplete_fn(interaction, "")
 
     assert result is None or result == [], "Unauthorized users must receive no suggestions"
-

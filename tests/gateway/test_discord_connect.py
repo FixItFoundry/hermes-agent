@@ -47,11 +47,9 @@ def _ensure_discord_mock():
         discord_mod.Color = SimpleNamespace(orange=lambda: 1, green=lambda: 2, blue=lambda: 3, red=lambda: 4)
         discord_mod.Interaction = object
         discord_mod.Embed = MagicMock
-        discord_mod.app_commands = SimpleNamespace(
-            describe=lambda **kwargs: (lambda fn: fn),
-            choices=lambda **kwargs: (lambda fn: fn),
-            Choice=lambda **kwargs: SimpleNamespace(**kwargs),
-        )
+        discord_mod.app_commands = MagicMock()
+        discord_mod.app_commands.autocomplete = lambda **kwargs: (lambda fn: fn)
+
         discord_mod.opus = SimpleNamespace(is_loaded=lambda: True)
 
         ext_mod = MagicMock()
@@ -67,6 +65,22 @@ def _ensure_discord_mock():
 
 
 _ensure_discord_mock()
+
+# Backfill attrs older copies of this stub lack: the adapter now uses
+# discord.app_commands.autocomplete (/model live search), and connect()
+# has `except discord.LoginFailure` (a MagicMock there raises TypeError
+# at exception-match time).
+import types as _types
+_dm = sys.modules["discord"]
+_lf = getattr(_dm, "LoginFailure", None)
+if not (isinstance(_lf, type) and issubclass(_lf, BaseException)):
+    _dm.LoginFailure = Exception
+_ac = getattr(_dm, "app_commands", None)
+if _ac is not None and not hasattr(_ac, "autocomplete"):
+    try:
+        _ac.autocomplete = lambda **kw: (lambda fn: fn)
+    except Exception:
+        pass
 
 import plugins.platforms.discord.adapter as discord_platform  # noqa: E402
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402

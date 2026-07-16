@@ -72,7 +72,7 @@ async def _connect(adapter: DiscordAdapter, monkeypatch, bot_factory):
     monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
     intents = SimpleNamespace(
         message_content=False, dm_messages=False, guild_messages=False,
-        members=False, voice_states=False,
+        members=False, voice_states=False, autocomplete=False,
     )
     monkeypatch.setattr(discord_platform.Intents, "default", lambda: intents)
     monkeypatch.setattr(discord_platform.commands, "Bot", bot_factory)

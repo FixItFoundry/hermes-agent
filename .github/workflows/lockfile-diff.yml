@@ -7,17 +7,12 @@ name: Lockfile diff
 # the ``packages`` map at the merge base and at HEAD and set-diffs the
 # {install path: version} maps instead.
 #
-# The comment is upserted: the script embeds a hidden HTML marker and the
-# workflow PATCHes the existing comment when one is found, so a PR gets
-# exactly one lockfile-diff comment that tracks the latest push instead
-# of a stack of stale ones. When a later push reverts all lockfile
-# changes, the comment is updated to say so (deleting it would be more
-# surprising than telling the reviewer it's resolved).
+# The semantic diff is exposed as a workflow_call output (boolean
+# ``changed``) and an artifact (``lockfile-diff`` containing the markdown
+# fragment) so the CI orchestrator's unified review-comment job can
+# include the section with its own header and action note.
 #
-# Never blocking — this is review signal, not enforcement. The semantic
-# diff is exposed as a workflow_call output (boolean ``changed``) and an
-# artifact (``lockfile-diff`` containing the markdown) so the CI
-# orchestrator's unified review-comment job can include the section.
+# Never blocking — this is review signal, not enforcement.
 
 on:
   workflow_call:
@@ -61,7 +56,11 @@ jobs:
             --output /tmp/lockfile-diff.md
           if [ -s /tmp/lockfile-diff.md ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            cat /tmp/lockfile-diff.md >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "## package-lock.json semantic diff"
+              echo ""
+              cat /tmp/lockfile-diff.md
+            } >> "$GITHUB_STEP_SUMMARY"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
             # Write an empty placeholder so the artifact upload step always

@@ -13,18 +13,33 @@ Inputs arrive as CLI args:
 * ``--lockfile-diff`` — path to the lockfile diff markdown (downloaded from
   the ``lockfile-diff`` artifact). Only meaningful when ``--lockfile-changed``
   is ``true``.
-* ``--ci-reviewed`` — ``true`` / ``false`` / empty (job was skipped).
+* ``--ci-review`` — ``true`` / ``false`` / empty (the lane didn't run →
+  no CI-sensitive changes, so the section is omitted).
+* ``--mcp-catalog`` — ``true`` / ``false`` / empty (same tri-state).
 
-Each section is only included when the corresponding job actually ran, so a
+Each section is only included when the corresponding lane actually ran, so a
 PR that doesn't touch lockfiles or the MCP catalog gets a shorter comment.
 Exits 0 always — comment posting is best-effort (fork PRs are read-only).
 
+Section format (consistent across all sections)::
+
+    ### {emoji} {Title}
+
+    **{Action required | Information}** — {one-line summary}. {action note}
+
+    {data — tables, bullet lists, etc.}
+
+``Action required`` means a human must do something before merge (add a
+label, verify a finding). ``Information`` means the section is purely
+informational — no action needed, the data is there for reference.
+
 Usage::
 
-    python scripts/ci/assemble_review_comment.py \
-        --lockfile-changed "$LOCKFILE_CHANGED" \
-        --lockfile-diff /tmp/lockfile-diff.md \
-        --ci-reviewed "$CI_REVIEWED" \
+    python scripts/ci/assemble_review_comment.py \\
+        --lockfile-changed "$LOCKFILE_CHANGED" \\
+        --lockfile-diff /tmp/lockfile-diff.md \\
+        --ci-review "$CI_REVIEW" \\
+        --mcp-catalog "$MCP_CATALOG" \\
         --output /tmp/comment-body.md
 """
 
@@ -63,92 +78,107 @@ def section_lockfile(changed: bool | None, diff_path: Path) -> str:
     if not changed:
         return (
             "### 📦 package-lock.json\n\n"
-            "✅ No lockfile changes — locked versions match the target branch.\n"
+            "**Information** — No lockfile changes. "
+            "Locked versions match the target branch.\n"
         )
     content = diff_path.read_text(encoding='utf-8').strip() if diff_path.exists() else ""
     if not content:
         return (
             "### 📦 package-lock.json\n\n"
-            "Lockfile changes detected but the diff content was unavailable.\n"
+            "**Action required** — Lockfile changes detected but the diff "
+            "content was unavailable (artifact expired or download failed). "
+            "Inspect `package-lock.json` directly.\n"
         )
-    # Ensure the diff content starts with the section header we want.
-    return f"### 📦 package-lock.json\n\n{content}\n"
+    return (
+        "### 📦 package-lock.json\n\n"
+        "**Information** — Locked npm dependency versions changed. "
+        "Review the version deltas below.\n\n"
+        f"{content}\n"
+    )
 
 
 def section_ci_review(reviewed: bool | None) -> str:
     """Build the CI-sensitive file review section."""
     if reviewed is None:
-        # Job was skipped — no CI-sensitive files changed.
+        # Lane didn't run — no CI-sensitive files changed.
         return ""
     if reviewed:
         return (
             "### 🔒 CI-sensitive file review\n\n"
-            "✅ The `ci-reviewed` label is present on this PR.\n"
+            "**Information** — `ci-reviewed` label is present. "
+            "No action needed.\n"
         )
     return (
-        "### ⚠️ CI-sensitive file review\n\n"
-        "This PR changes CI-sensitive files (eslint config, workflow YAMLs, "
-        "or composite actions). These files influence what code the js-autofix "
-        "job executes and pushes to main.\n\n"
-        "A maintainer should verify:\n"
+        "### 🔒 CI-sensitive file review\n\n"
+        "**Action required** — This PR changes CI-sensitive files "
+        "(eslint config, workflow YAMLs, or composite actions). "
+        "These influence what the js-autofix job executes and pushes to main. "
+        "Add the `ci-reviewed` label after verifying:\n"
         "- no new eslint rules with custom `fix` functions that write outside linted paths,\n"
         "- no workflow changes that widen permissions or remove guards,\n"
-        "- no composite action changes that alter what gets executed.\n\n"
-        "After review, add the `ci-reviewed` label and re-run this check.\n"
+        "- no composite action changes that alter what gets executed.\n"
     )
 
 
 def section_mcp_review(reviewed: bool | None) -> str:
     """Build the MCP catalog security review section."""
     if reviewed is None:
-        # Job was skipped — no MCP catalog changes.
+        # Lane didn't run — no MCP catalog changes.
         return ""
     if reviewed:
         return (
             "### 🔧 MCP catalog security review\n\n"
-            "✅ The `ci-reviewed` label is present on this PR.\n"
+            "**Information** — `ci-reviewed` label is present. "
+            "No action needed.\n"
         )
     return (
-        "### ⚠️ MCP catalog security review\n\n"
-        "This PR changes the bundled MCP catalog or MCP catalog installer code. "
-        "MCP entries can define local commands that users later install into "
-        "`mcp_servers`, so this needs explicit maintainer review before merge.\n\n"
-        "A maintainer should verify:\n"
+        "### 🔧 MCP catalog security review\n\n"
+        "**Action required** — This PR changes the bundled MCP catalog or "
+        "MCP catalog installer code. MCP entries can define local commands "
+        "that users later install into `mcp_servers`, so this needs explicit "
+        "maintainer review before merge. "
+        "Add the `ci-reviewed` label after verifying:\n"
         "- any new/changed `optional-mcps/**/manifest.yaml` command and args are expected,\n"
         "- stdio transports do not use shell+egress/exfiltration payloads,\n"
         "- git install refs are pinned and bootstrap commands are minimal,\n"
-        "- requested env vars/secrets match the upstream MCP's documented needs.\n\n"
-        "After review, add the `ci-reviewed` label and re-run this check.\n"
+        "- requested env vars/secrets match the upstream MCP's documented needs.\n"
     )
 
 
 def assemble(
     lockfile_changed: bool | None,
     lockfile_diff: Path,
-    ci_reviewed: bool | None,
+    ci_review: bool | None,
+    mcp_catalog: bool | None,
 ) -> str:
-    """Assemble the full comment body from individual job outputs."""
+    """Assemble the full comment body from individual job outputs.
+
+    Each section builder receives ``None`` when its lane was skipped (so
+    the section is omitted entirely), or a ``bool`` when the lane ran
+    (``True`` = label present / changes detected, ``False`` = missing /
+    no changes).
+    """
     sections: list[str] = []
 
     lf = section_lockfile(lockfile_changed, lockfile_diff)
     if lf:
         sections.append(lf)
 
-    cr = section_ci_review(ci_reviewed)
+    cr = section_ci_review(ci_review)
     if cr:
         sections.append(cr)
 
-    mr = section_mcp_review(ci_reviewed)
+    mr = section_mcp_review(mcp_catalog)
     if mr:
         sections.append(mr)
 
     if not sections:
-        # All jobs were skipped or reported no issues — still post a comment
-        # so the pending → done transition is visible.
+        # All lanes were skipped or reported no issues — still post a
+        # comment so the pending → done transition is visible.
         body = (
             f"{MARKER}\n"
             "## ✅ CI review\n\n"
-            "All review checks passed — no issues to report.\n"
+            "**Information** — All review checks passed. No issues to report.\n"
         )
     else:
         body = f"{MARKER}\n## ૮ >ﻌ< ა CI review\n\n" + "---\n".join(sections)
@@ -170,9 +200,14 @@ def main() -> int:
         help="Path to the lockfile diff markdown file.",
     )
     parser.add_argument(
-        "--ci-reviewed",
+        "--ci-review",
         default="",
-        help="ci-reviewed label status: 'true', 'false', or empty (skipped).",
+        help="ci-reviewed label status: 'true', 'false', or empty (lane skipped).",
+    )
+    parser.add_argument(
+        "--mcp-catalog",
+        default="",
+        help="MCP catalog review status: 'true', 'false', or empty (lane skipped).",
     )
     parser.add_argument(
         "--output",
@@ -185,7 +220,8 @@ def main() -> int:
     body = assemble(
         lockfile_changed=_bool(args.lockfile_changed),
         lockfile_diff=args.lockfile_diff,
-        ci_reviewed=_bool(args.ci_reviewed),
+        ci_review=_bool(args.ci_review),
+        mcp_catalog=_bool(args.mcp_catalog),
     )
 
     args.output.write_text(body)

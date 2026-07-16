@@ -227,7 +227,14 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           LOCKFILE_CHANGED: ${{ needs.lockfile-diff.outputs.changed }}
-          CI_REVIEWED: ${{ needs.review-labels.outputs.ci_reviewed }}
+          CI_REVIEW: ${{ needs.review-labels.outputs.ci_reviewed }}
+          # detect outputs tell us *which lanes ran*, so the assemble script
+          # can omit sections for lanes that were skipped (no changes in that
+          # area).  CI_REVIEW lane ran → pass the label status through.
+          # MCP_CATALOG lane ran → pass the same label status (the label
+          # gate job is shared: ci-reviewed covers both).
+          CI_REVIEW_LANE: ${{ needs.detect.outputs.ci_review }}
+          MCP_CATALOG_LANE: ${{ needs.detect.outputs.mcp_catalog }}
         run: |
           set -uo pipefail
 
@@ -240,10 +247,23 @@ jobs:
             LOCKFILE_DIFF_PATH="/tmp/lockfile-diff-fallback.md"
           fi
 
+          # Only pass the label status when the lane actually ran. If the
+          # lane was skipped (detect output was false), pass empty so the
+          # section is omitted entirely.
+          CI_REVIEW_ARG=""
+          if [ "$CI_REVIEW_LANE" = "true" ]; then
+            CI_REVIEW_ARG="$CI_REVIEW"
+          fi
+          MCP_CATALOG_ARG=""
+          if [ "$MCP_CATALOG_LANE" = "true" ]; then
+            MCP_CATALOG_ARG="$CI_REVIEW"
+          fi
+
           python3 scripts/ci/assemble_review_comment.py \
             --lockfile-changed "$LOCKFILE_CHANGED" \
             --lockfile-diff "$LOCKFILE_DIFF_PATH" \
-            --ci-reviewed "$CI_REVIEWED" \
+            --ci-review "$CI_REVIEW_ARG" \
+            --mcp-catalog "$MCP_CATALOG_ARG" \
             --output /tmp/comment-body.md
 
           echo "Assembled comment body:"

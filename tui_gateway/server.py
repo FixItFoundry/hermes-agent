@@ -9156,6 +9156,18 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     payload["rendered"] = r
                 _emit("message.delta", sid, payload)
 
+            # Surface interim assistant text (commentary emitted alongside
+            # tool calls, or the attempted final answer before a verify-on-stop
+            # nudge) so the desktop can seal it as its own segment instead of
+            # losing it when message.complete replaces the streaming buffer.
+            def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+                _emit("message.interim", sid, {
+                    "text": text,
+                    "already_streamed": already_streamed,
+                })
+
+            agent.interim_assistant_callback = _interim_assistant_cb
+
             run_kwargs = {
                 "conversation_history": list(history),
                 "stream_callback": _stream,
@@ -9432,6 +9444,9 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             if home_token is not None:
                 reset_hermes_home_override(home_token)
             _clear_session_context(session_tokens)
+            # Clear the per-turn interim callback so a stale closure from
+            # this turn can't fire during a later turn on the same agent.
+            agent.interim_assistant_callback = None
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()

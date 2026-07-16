@@ -53,6 +53,7 @@ import { hasSessionInfoStatePatch, sessionInfoStatePatch, SUBAGENT_EVENT_TYPES, 
 
 const COMPACTION_RESUME_EVENT_TYPES = new Set([
   'message.delta',
+  'message.interim',
   'thinking.delta',
   'reasoning.delta',
   'reasoning.available',
@@ -76,6 +77,7 @@ interface GatewayEventDeps {
   flushQueuedDeltas: (sessionId?: string) => void
   queryClient: QueryClient
   refreshHermesConfig: () => Promise<void>
+  sealInterimAssistantMessage: (sessionId: string, text: string) => void
   sessionInterrupted: (sessionId: string) => boolean
   updateSessionState: (
     sessionId: string,
@@ -104,6 +106,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
     flushQueuedDeltas,
     queryClient,
     refreshHermesConfig,
+    sealInterimAssistantMessage,
     sessionInterrupted,
     updateSessionState,
     upsertToolCall
@@ -308,6 +311,18 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       } else if (event.type === 'message.delta') {
         if (sessionId) {
           appendAssistantDelta(sessionId, coerceGatewayText(payload?.text))
+        }
+      } else if (event.type === 'message.interim') {
+        // The agent emitted interim assistant commentary (text alongside tool
+        // calls, or the attempted final answer before a verify-on-stop nudge).
+        // Seal it so message.complete's replaceTextPart doesn't wipe it — the
+        // text was already streamed via message.delta and is visible to the user.
+        if (sessionId) {
+          flushQueuedDeltas(sessionId)
+          const text = coerceGatewayText(payload?.text)
+          if (text) {
+            sealInterimAssistantMessage(sessionId, text)
+          }
         }
       } else if (event.type === 'thinking.delta') {
         // thinking.delta carries the kawaii spinner status (face + verb from

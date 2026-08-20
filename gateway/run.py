@@ -15695,13 +15695,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
             return YuanbaoAdapter(config)
 
-        elif platform == Platform.RABBIT_R1:
-            from gateway.platforms.rabbit_r1 import RabbitR1Adapter, check_rabbit_r1_requirements
-            if not check_rabbit_r1_requirements():
-                logger.warning("Rabbit R1: websockets not installed. Run: pip install websockets")
-                return None
-            return RabbitR1Adapter(config)
-
         return None
 
     def _make_adapter_auth_check(

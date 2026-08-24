@@ -24,6 +24,7 @@ import ssl
 import subprocess
 import sys
 import threading
+import time
 from urllib.parse import unquote, urlsplit
 
 ROOT, CERTS, REAL_CA = map(pathlib.Path, sys.argv[1:])
@@ -172,11 +173,19 @@ def forward_https(conn, host, port, request):
     # upstream->client (responses). Each ends when its peer EOFs or errors;
     # when either side finishes, the whole tunnel is torn down.
     context = ssl.create_default_context(cafile=str(REAL_CA))
-    try:
-        raw = socket.create_connection((host, port), timeout=UPSTREAM_IDLE_SECONDS)
-        upstream = context.wrap_socket(raw, server_hostname=host)
-    except OSError:
-        return
+    upstream = None
+    # A transient upstream connect/TLS failure looks like "empty reply" to the
+    # client, which reads as a broken installer rather than a network blip.
+    # Retry the handshake a few times before giving up on this tunnel.
+    for attempt in range(3):
+        try:
+            raw = socket.create_connection((host, port), timeout=UPSTREAM_IDLE_SECONDS)
+            upstream = context.wrap_socket(raw, server_hostname=host)
+            break
+        except OSError:
+            if attempt == 2:
+                return
+            time.sleep(1)
 
     def c2u():
         # Client requests: forward verbatim (minus hop-by-hop headers).

@@ -188,6 +188,14 @@ install_in_sandbox() {
   local log="$LOG_DIR/$tag.log"
   local args=(install --persistent)
   [ -n "$ref" ] && args+=(--install-ref "$ref")
+  # Serve the uv installer script from the sandbox's fixture root: astral.sh
+  # intermittently returns empty replies to GitHub runner egress IPs, which
+  # kills the install with a bare `curl: (52)` that looks like a broken
+  # installer. Prefetch it once on the runner (with retries) and let the MITM
+  # proxy serve the copy; the binary download it performs still goes upstream.
+  if [ -n "$UV_INSTALLER_FIXTURE" ]; then
+    args+=(--http-root "$UV_INSTALLER_FIXTURE")
+  fi
 
   # Installer flags have to match the installer being run, not this checkout's.
   # Older releases reject options added later ("Unknown option: --skip-browser"),
@@ -247,6 +255,29 @@ require_hermes_works() {
 }
 
 # ── install the earlier Hermes ─────────────────────────────────────────────
+# Prefetch the astral.sh uv installer so the sandbox can serve it as a
+# fixture. Best-effort with retries: if every attempt fails we proceed
+# without the fixture and let the in-sandbox curl try upstream itself.
+UV_INSTALLER_FIXTURE=""
+if command -v curl >/dev/null 2>&1; then
+  UV_FIXTURE_DIR="$LOG_DIR/http-fixture"
+  mkdir -p "$UV_FIXTURE_DIR/astral.sh/uv"
+  for _attempt in 1 2 3 4 5; do
+    if curl -fsSL --retry 3 --retry-delay 2 https://astral.sh/uv/install.sh \
+        -o "$UV_FIXTURE_DIR/astral.sh/uv/install.sh" 2>/dev/null \
+       && [ -s "$UV_FIXTURE_DIR/astral.sh/uv/install.sh" ]; then
+      UV_INSTALLER_FIXTURE="$UV_FIXTURE_DIR"
+      break
+    fi
+    sleep 3
+  done
+fi
+if [ -n "$UV_INSTALLER_FIXTURE" ]; then
+  ok "prefetched uv installer for sandbox fixture"
+else
+  echo "⚠ could not prefetch uv installer; install will fetch astral.sh directly" >&2
+fi
+
 step "installing upstream $INSTALL_REF (real curl | install.sh: uv, Python, Node, venv)"
 install_in_sandbox "install of upstream $INSTALL_REF" "$INSTALL_REF" install
 

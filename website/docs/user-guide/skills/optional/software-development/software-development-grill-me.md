@@ -1,12 +1,12 @@
 ---
-title: "Plan Interrogation — Adversarial plan interview before implementation"
-sidebar_label: "Plan Interrogation"
+title: "Grill Me — Adversarial plan interview before implementation"
+sidebar_label: "Grill Me"
 description: "Adversarial plan interview before implementation"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
-# Plan Interrogation
+# Grill Me
 
 Adversarial plan interview before implementation.
 
@@ -14,14 +14,14 @@ Adversarial plan interview before implementation.
 
 | | |
 |---|---|
-| Source | Optional — install with `hermes skills install official/software-development/plan-interrogation` |
-| Path | `optional-skills/software-development/plan-interrogation` |
+| Source | Optional — install with `hermes skills install official/software-development/grill-me` |
+| Path | `optional-skills/software-development/grill-me` |
 | Version | `2.0.0` |
 | Author | Rafael Zendron (rafaumeu) + Matt Pocock (mattpocock/skills, grilling) + Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos, windows |
 | Tags | `planning`, `adversarial`, `interview`, `decision-tree`, `pre-implementation`, `review`, `alignment` |
-| Related skills | [`plan`](/docs/user-guide/skills/bundled/software-development/software-development-plan), [`requesting-code-review`](/docs/user-guide/skills/bundled/software-development/software-development-requesting-code-review), [`subagent-driven-development`](/docs/user-guide/skills/optional/software-development/software-development-subagent-driven-development), [`test-driven-development`](/docs/user-guide/skills/bundled/software-development/software-development-test-driven-development) |
+| Related skills | `plan` (now the built-in `/plan` command), [`requesting-code-review`](/docs/user-guide/skills/bundled/software-development/software-development-requesting-code-review), [`subagent-driven-development`](/docs/user-guide/skills/optional/software-development/software-development-subagent-driven-development), [`test-driven-development`](/docs/user-guide/skills/bundled/software-development/software-development-test-driven-development) |
 
 ## Reference: full SKILL.md
 
@@ -29,19 +29,19 @@ Adversarial plan interview before implementation.
 The following is the complete skill definition that Hermes loads when this skill is triggered. This is what the agent sees as instructions when the skill is active.
 :::
 
-# Plan Interrogation
+# Grill Me
 
 Stress-tests a plan through structured adversarial questioning before any
 code is written. Models the plan as a **design tree** — every decision
 branches into the decisions that hang off it — and interviews the user in
 rounds until every branch is resolved and nothing is silently assumed.
 
-Formerly `grill-me`. Combines the phase discipline of the original with the
-frontier-rounds mechanic from mattpocock/skills' `grilling`.
+Combines the phase discipline of the original with the frontier-rounds
+mechanic from mattpocock/skills' `grilling`.
 
 ## When to Use
 
-- User says "interrogate my plan", "grill me", "stress test this idea"
+- User says "grill me", "interview my plan", "stress test this idea"
 - Before complex work: auth flows, schema changes, migrations, payments
 - A plan has unresolved decisions or seems vague
 - Before `subagent-driven-development` decomposition

@@ -431,6 +431,31 @@ async def _lifespan(app: "FastAPI"):
 
     record_boot_fingerprint()
 
+    # Hosted Bot rooms belong to the backend process, not to any connected
+    # Desktop socket. Recovery may need a contended state.db migration, so keep
+    # it off the lifespan's pre-yield path: Group Chat startup must degrade on
+    # its own instead of preventing every dashboard/Desktop feature from booting.
+    from tui_gateway import methods_groups as _hosted_groups
+    import tui_gateway.server  # noqa: F401
+
+    hosted_room_start_cancel = threading.Event()
+
+    def _start_hosted_rooms() -> None:
+        try:
+            _hosted_groups.start_hosted_room_service()
+        except Exception:
+            _log.exception("Hosted Group Chat recovery failed during backend startup")
+        finally:
+            if hosted_room_start_cancel.is_set():
+                _hosted_groups.stop_hosted_room_service(timeout=1.0)
+
+    hosted_room_start_thread = threading.Thread(
+        target=_start_hosted_rooms,
+        daemon=True,
+        name="hosted-room-startup",
+    )
+    hosted_room_start_thread.start()
+
     # Desktop-spawned backends (HERMES_DESKTOP=1) fire cron jobs themselves,
     # since the app has no gateway running the scheduler. Server `hermes
     # dashboard` is unaffected — it relies on its own gateway.
@@ -473,6 +498,9 @@ async def _lifespan(app: "FastAPI"):
     try:
         yield
     finally:
+        hosted_room_start_cancel.set()
+        _hosted_groups.stop_hosted_room_service(timeout=5.0)
+        hosted_room_start_thread.join(timeout=1.0)
         if cron_stop is not None:
             cron_stop.set()
         pty_reaper_task.cancel()
@@ -7718,8 +7746,39 @@ def _apply_model_assignment_sync(
         model_cfg = _apply_main_model_assignment(
             cfg.get("model", {}), provider, model, base_url, api_key
         )
-        if isinstance(provider_entry, dict) and provider_entry.get("api_key"):
-            model_cfg["api_key"] = provider_entry["api_key"]
+        _raw_assign_entry = None
+        try:
+            _stored, _raw_assign_entry = find_provider_entry(
+                read_raw_config().get("providers"), provider
+            )
+        except Exception:
+            _raw_assign_entry = None
+        _assign_key_env = (
+            str(_raw_assign_entry.get("key_env") or "").strip()
+            if isinstance(_raw_assign_entry, dict)
+            else ""
+        )
+        if _assign_key_env:
+            # #88990: carry the credential POINTER, never a resolved secret.
+            model_cfg["key_env"] = _assign_key_env
+            model_cfg.pop("api_key", None)
+        elif isinstance(provider_entry, dict) and provider_entry.get("api_key"):
+            # #88990: provider_entry comes from load_config(), which expands
+            # ${VAR} env refs to plaintext. Copying that resolved value into
+            # model.api_key writes the SECRET into config.yaml (and recreates
+            # it on every re-apply, even after the user deletes it by hand).
+            # Prefer the raw ${VAR} template; only fall back to the expanded
+            # value when the raw yaml itself stores the key as a literal (no
+            # new exposure in that case).
+            _raw_key = (
+                str(_raw_assign_entry.get("api_key") or "").strip()
+                if isinstance(_raw_assign_entry, dict)
+                else ""
+            )
+            if _raw_key.startswith("${") and _raw_key.endswith("}"):
+                model_cfg["api_key"] = _raw_key
+            else:
+                model_cfg["api_key"] = provider_entry["api_key"]
         cfg["model"] = model_cfg
 
         # When switching the main provider to Nous, mirror the CLI's
@@ -8637,7 +8696,25 @@ def activate_custom_endpoint(endpoint_id: str, profile: Optional[str] = None):
                 model_cfg["key_env"] = entry["key_env"]
                 model_cfg.pop("api_key", None)
             elif entry.get("api_key"):
-                model_cfg["api_key"] = entry["api_key"]
+                # Same #88990 shape as /api/model/set: `cfg` is env-expanded,
+                # so a raw `${VAR}` api_key would land as plaintext. Copy the
+                # raw template when that's what's on disk.
+                _raw_entry = None
+                try:
+                    _stored_raw, _raw_entry = find_provider_entry(
+                        read_raw_config().get("providers"), provider_key
+                    )
+                except Exception:
+                    _raw_entry = None
+                _raw_key = (
+                    str(_raw_entry.get("api_key") or "").strip()
+                    if isinstance(_raw_entry, dict)
+                    else ""
+                )
+                if _raw_key.startswith("${") and _raw_key.endswith("}"):
+                    model_cfg["api_key"] = _raw_key
+                else:
+                    model_cfg["api_key"] = entry["api_key"]
             cfg["model"] = model_cfg
             save_config(cfg)
         return {"ok": True, "provider": provider_key, "model": model}

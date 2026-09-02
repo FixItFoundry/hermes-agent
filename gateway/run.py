@@ -7721,6 +7721,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # context pin; last-delivered voice-channel context) lives on
         # SessionState.conversation — see gateway/session_state.py.
         self._kanban_notifier_profile = self._active_profile_name()
+        # Launch-time identity of the profile that owns ``self.adapters``;
+        # ``_authorization_adapter`` compares against this rather than the
+        # per-turn ``_active_profile_name()`` (see gateway/authz_mixin.py).
+        self._primary_profile_name = self._kanban_notifier_profile
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
         self._teams_pipeline_runtime_error: Optional[str] = None
@@ -14547,6 +14551,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Start background session expiry watcher to finalize expired sessions
         self._spawn_supervised(self._session_expiry_watcher, "session_expiry_watcher")
 
+        # Keep the /model picker's remote catalogs (curated manifest,
+        # OpenRouter live list, Nous Portal recommendations) warm on disk so a
+        # delisted or newly-published model reaches the picker within one TTL
+        # window (model_catalog.ttl_minutes, default 20) without waiting for a
+        # cold /model open to trigger the refresh.
+        self._spawn_supervised(self._model_catalog_refresh_watcher, "model_catalog_refresh_watcher")
+
         # Stall watchdog: pending inbound + stale agent activity → warn user
         # to /new (does not kill the turn; see agent.session_stall_timeout).
         self._spawn_supervised(self._session_stall_watcher, "session_stall_watcher")
@@ -15669,6 +15680,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 notified_map.pop(key, None)
 
         return sent
+
+    async def _model_catalog_refresh_watcher(self) -> None:
+        """Refresh the /model picker's remote catalogs every TTL window.
+
+        The picker itself only refreshes on a cold or stale open, so a
+        gateway that nobody opens ``/model`` in keeps serving whatever was
+        cached. This loop calls ``model_catalog.refresh_catalogs()`` (manifest
+        + OpenRouter live filter + Nous Portal recommendations) off-thread on
+        the configured cadence (``model_catalog.ttl_minutes``, default 20) so
+        the on-disk caches every surface reads are never older than one window.
+        """
+        from hermes_cli.model_catalog import refresh_catalogs, refresh_interval_seconds
+
+        await asyncio.sleep(30)  # let startup settle
+        while self._running:
+            try:
+                await asyncio.to_thread(refresh_catalogs)
+            except Exception as exc:
+                logger.debug("Model catalog refresh failed: %s", exc)
+            try:
+                interval = refresh_interval_seconds()
+            except Exception:
+                interval = 1200.0
+            deadline = time.monotonic() + interval
+            while self._running and time.monotonic() < deadline:
+                await asyncio.sleep(min(30.0, max(0.0, deadline - time.monotonic())))
 
     async def _session_stall_watcher(self, interval: float = 30.0):
         """Periodic pending-inbound + stale-activity stall watchdog (#72016).
@@ -17800,11 +17837,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ``profile_name`` binds the callback to the secondary adapter's own
         multiplex profile, so its ``SessionSource`` resolves that profile's
         secret scope instead of falling back to the active profile.
+
+        For the shared primary adapter under ``multiplex_profiles``
+        (``profile_name`` is None) the callback mirrors the inbound message
+        path exactly: the chat's ``profile_routes`` match is stamped on the
+        source so the routed profile's pairing store is consulted, while the
+        allowlist/gate reads stay under the transport (launch) home via
+        ``_is_user_authorized_for_source`` — the same split
+        ``_make_default_profile_message_handler`` applies. Without this an
+        inline-button caller approved only in the routed profile's pairing
+        store was denied (#86296), because the adapter's callback source was
+        never route-stamped.
         """
+        multiplex = bool(getattr(self.config, "multiplex_profiles", False))
+        transport_home = (
+            Path(get_hermes_home()) if multiplex and profile_name is None else None
+        )
+
         def check(
             user_id: str,
             chat_type: Optional[str] = None,
             chat_id: Optional[str] = None,
+            *,
+            is_bot: bool = False,
+            thread_id: Optional[str] = None,
         ) -> bool:
             if not user_id:
                 return False
@@ -17813,9 +17869,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 chat_id=chat_id or "",
                 chat_type=chat_type or "group",
                 user_id=user_id,
+                thread_id=thread_id,
+                is_bot=bool(is_bot),
                 profile=profile_name,
             )
-            return self._is_user_authorized(source)
+            # Same in-process transport provenance ``build_source`` retains, so
+            # adapter-level policy reads (config.yaml group_allowed_chats,
+            # allow_from) resolve the receiving adapter even once the routed
+            # profile is stamped below.
+            registry = (
+                (getattr(self, "_profile_adapters", None) or {}).get(profile_name)
+                if profile_name
+                else getattr(self, "adapters", None)
+            ) or {}
+            adapter = registry.get(platform)
+            if adapter is not None:
+                source._transport_adapter_ref = _weakref.ref(adapter)
+            if transport_home is None:
+                return self._is_user_authorized(source)
+            source._authorization_profile_home = transport_home
+            from gateway.profile_routing import ProfileRouteRejected
+
+            try:
+                source.profile = self._profile_name_for_source(source)
+            except ProfileRouteRejected:
+                # Same fail-closed outcome as the ingress gate in
+                # ``_handle_message`` for a route to an unserved profile.
+                return False
+            return self._is_user_authorized_for_source(source)
         return check
 
 

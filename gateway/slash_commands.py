@@ -3440,7 +3440,9 @@ class GatewaySlashCommandsMixin:
             max_file_size_mb=cp_kwargs["checkpoint_max_file_size_mb"],
         )
 
-        cwd = os.getenv("TERMINAL_CWD", str(Path.home()))
+        from tools.terminal_scope import terminal_env as _tenv
+
+        cwd = _tenv("TERMINAL_CWD", str(Path.home()))
         arg = event.get_command_args().strip()
 
         # --all / --force: classic full restore, overwriting user edits too.
@@ -3534,7 +3536,9 @@ class GatewaySlashCommandsMixin:
             elif low == "session":
                 mode = "session"
 
-        cwd = os.getenv("TERMINAL_CWD", str(Path.home()))
+        from tools.terminal_scope import terminal_env as _tenv
+
+        cwd = _tenv("TERMINAL_CWD", str(Path.home()))
 
         if mode == "session":
             return await self._gateway_session_diff(cwd, stat_only)
@@ -4122,6 +4126,9 @@ class GatewaySlashCommandsMixin:
                 tier = None
                 saved_value = "normal"
                 label = t("gateway.fast.label_normal")
+            elif value in {"auto", "cold"}:
+                tier = saved_value = value
+                label = value.upper()
             else:
                 return t("gateway.fast.unknown_arg", arg=value)
             self._service_tier = tier
@@ -4144,7 +4151,8 @@ class GatewaySlashCommandsMixin:
 
         if not args or args == "status":
             is_fast = self._service_tier == "priority"
-            status = t("gateway.fast.status_fast") if is_fast else t("gateway.fast.status_normal")
+            mode = "fast" if is_fast else (self._service_tier or "normal")
+            status = {"fast": t("gateway.fast.status_fast"), "normal": t("gateway.fast.status_normal")}.get(mode, mode)
 
             async def _on_fast_choice(_chat_id: str, value: str) -> str:
                 return _apply_fast_selection(value, persist=persist_global)
@@ -4162,7 +4170,17 @@ class GatewaySlashCommandsMixin:
                     {
                         "value": "normal",
                         "label": t("gateway.fast.choice_normal"),
-                        "is_current": not is_fast,
+                        "is_current": mode == "normal",
+                    },
+                    {
+                        "value": "auto",
+                        "label": t("gateway.fast.choice_auto"),
+                        "is_current": mode == "auto",
+                    },
+                    {
+                        "value": "cold",
+                        "label": t("gateway.fast.choice_cold"),
+                        "is_current": mode == "cold",
                     },
                 ],
                 on_choice_selected=_on_fast_choice,
@@ -4959,6 +4977,7 @@ class GatewaySlashCommandsMixin:
             await self._session_db.enable_telegram_topic_mode(
                 chat_id=str(source.chat_id),
                 user_id=str(source.user_id),
+                profile_name=self._telegram_topic_profile_name(source),
                 has_topics_enabled=capabilities.get("has_topics_enabled"),
                 allows_users_to_create_topics=capabilities.get("allows_users_to_create_topics"),
             )
@@ -4974,6 +4993,7 @@ class GatewaySlashCommandsMixin:
                 binding = await self._session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
+                    profile_name=self._telegram_topic_profile_name(source),
                 )
             except Exception:
                 logger.debug("Failed to read Telegram topic binding", exc_info=True)

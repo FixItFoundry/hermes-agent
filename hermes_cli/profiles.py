@@ -1261,6 +1261,18 @@ def create_profile(
         # Strip runtime files
         for stale in _CLONE_ALL_STRIP:
             (profile_dir / stale).unlink(missing_ok=True)
+        # A clone-all copies auth.json and .anthropic_oauth.json verbatim.
+        # Single-use OAuth grants (Anthropic / Codex / xAI) forked that way
+        # are one credential with two owners: the first profile to refresh
+        # revokes the pair for every sibling (#100339). Drop the copies; the
+        # clone reads the root grant through the credential-pool fallback.
+        from hermes_cli.auth import strip_cloned_single_use_oauth_grants
+        stripped = strip_cloned_single_use_oauth_grants(profile_dir)
+        if any(stripped.values()):
+            logger.info(
+                "profile %s: dropped cloned single-use OAuth grants %s "
+                "(inherits the root grant instead)", canon, stripped,
+            )
     else:
         # Bootstrap directory structure
         profile_dir.mkdir(parents=True, exist_ok=True)
@@ -2008,6 +2020,19 @@ def _stop_gateway_process(profile_dir: Path) -> None:
         raw = pid_file.read_text(encoding="utf-8").strip()
         data = json.loads(raw) if raw.startswith("{") else {"pid": int(raw)}
         pid = int(data["pid"])
+        # Cross-profile kill refusal (#89315): the record's hermes_home stamp
+        # names the gateway's TRUE owner. A contaminated/poisoned gateway.pid
+        # inside this profile dir can point at another profile's live gateway
+        # — killing it starts the mutual SIGTERM restart loop from the issue.
+        from gateway.status import recorded_gateway_home_conflicts
+
+        if recorded_gateway_home_conflicts(data, expected_home=profile_dir):
+            print(
+                f"✗ Refusing to stop PID {pid}: its recorded HERMES_HOME "
+                f"belongs to a different profile than {profile_dir} "
+                "(stale/poisoned PID record, #89315)."
+            )
+            return
         # Route through terminate_pid so Windows uses the appropriate
         # primitive (taskkill / TerminateProcess) — raw os.kill with
         # _signal.SIGKILL raises AttributeError at import time on Windows,

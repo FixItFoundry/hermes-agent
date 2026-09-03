@@ -609,6 +609,36 @@ def _image_error_max_dimension(error: Exception) -> Optional[int]:
     return None
 
 
+def _pressure_with_real_floor(compressor: Any, rough_tokens: int) -> int:
+    """Floor the ROUGH pre-API pressure estimate at the last REAL prompt size.
+
+    Applied only on the fallback path -- when ``anchored_context_tokens`` has
+    no valid anchor (first request, transcript rewritten under the anchor,
+    provider never reported usage). A valid anchor is provider-exact and is
+    used as-is; in particular on MoA turns the anchor deliberately uses the
+    pre-fold aggregator usage while ``last_real_prompt_tokens`` holds the
+    folded figure, so flooring an anchored value would re-add fan-out tokens
+    the anchor exists to exclude.
+
+    On the rough path, non-ASCII text (Cyrillic, Greek, Polish, ...)
+    under-counts by up to ~2x, so a session can sit at the provider's real
+    context ceiling while the rough figure stays under the compaction
+    threshold -- on silent-clip providers (ollama /v1) that is a truncation
+    death spiral the reactive overflow handler never sees (observed live:
+    real prompts 64,842->64,995 against a 55,705 threshold). The provider's
+    last reported prompt_tokens is authoritative; never let the rough figure
+    fall below it. Skipped for exactly one turn after a compaction, when
+    last_real_prompt_tokens still holds the stale pre-compression value
+    (#36718's awaiting_real_usage_after_compression window).
+    """
+    last_real = int(getattr(compressor, "last_real_prompt_tokens", 0) or 0)
+    if last_real > rough_tokens and not getattr(
+        compressor, "awaiting_real_usage_after_compression", False
+    ):
+        return last_real
+    return rough_tokens
+
+
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
     if not getattr(agent, "tools", None):
@@ -989,6 +1019,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     """
     stored_prompt = None
     stored_state = "missing"
+    session_row = None
     if conversation_history and agent._session_db:
         try:
             session_row = agent._session_db.get_session(agent.session_id)
@@ -1091,6 +1122,17 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         # Continuing session — reuse the exact system prompt from the
         # previous turn so the Anthropic cache prefix matches.
         agent._cached_system_prompt = stored_prompt
+        # Same contract for tools[]: a fresh AIAgent for an existing session
+        # (gateway agent-cache eviction) re-probed every check_fn, so pin the
+        # array back to the order this session already sent (tools freeze).
+        try:
+            saved_tools = session_row.get("tool_names") if session_row else None
+            if saved_tools:
+                from tools.mcp_tool import restore_agent_tool_prefix
+
+                restore_agent_tool_prefix(agent, json.loads(saved_tools))
+        except Exception:
+            logger.debug("tool prefix restore skipped", exc_info=True)
         # Prompt-section callbacks are new-session-only. Recover their frozen
         # bytes from the persisted full prompt so a later compression rebuild
         # keeps them without evaluating plugin state in this resumed process.
@@ -1173,6 +1215,9 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     if agent._session_db:
         try:
             agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
+            from tools.mcp_tool import persist_agent_tool_names
+
+            persist_agent_tool_names(agent)
         except Exception as exc:
             logger.warning(
                 "Session DB update_system_prompt failed for session %s: "
@@ -2698,6 +2743,13 @@ def run_conversation(
         # gated on context_compressor — so orphans from session loading or
         # manual message manipulation are always caught.
         api_messages = agent._sanitize_api_messages(api_messages)
+        # Send-path vision eviction (#89296): compression only strips stale
+        # screenshots when prune fires, and the Anthropic adapter's keep-window
+        # never sees OpenAI-style tool-result image_url parts. The per-call
+        # clone is rewritten in place; persisted history is untouched.
+        from agent.context_compressor import evict_stale_outbound_tool_images
+
+        evict_stale_outbound_tool_images(api_messages)
 
         # One-time repeated-heal escalation notice (#96870): if the sanitizer
         # above just crossed the per-session heal threshold, deliver the
@@ -2867,6 +2919,10 @@ def run_conversation(
         )
         if _anchored_pressure is not None:
             request_pressure_tokens = _anchored_pressure
+        else:
+            request_pressure_tokens = _pressure_with_real_floor(
+                agent.context_compressor, request_pressure_tokens
+            )
         total_chars = approx_tokens * 4
         # Stash this request's rough estimate so update_from_response() can
         # pair it with the provider's real prompt count — the (rough, real)
@@ -5414,7 +5470,7 @@ def run_conversation(
                 ):
                     _retry.nous_auth_retry_attempted = True
                     if agent._try_refresh_nous_client_credentials(force=True):
-                        print(f"{agent.log_prefix}🔐 Nous agent key refreshed after 401. Retrying request...")
+                        agent._buffer_vprint(f"🔐 Nous agent key refreshed after 401. Retrying request...")
                         continue
                     # Credential refresh didn't help — show diagnostic info.
                     # Most common causes: Portal OAuth expired/revoked,

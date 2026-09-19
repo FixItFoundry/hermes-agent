@@ -968,6 +968,55 @@ class TestClassifyApiError:
         assert result.retryable is True
         assert result.should_compress is False
 
+    def test_openai_regex_lookaround_rejection_strips_pattern_and_retries(self):
+        """Strict OpenAI-compatible endpoints reject ``pattern`` lookaround with a 400 (#42631).
+        Driven through the production path (classifier → ``recover_after_classification``):
+        the lookaround ``pattern`` must be stripped from ``agent.tools`` and the turn retried."""
+        from agent.turn_recovery import recover_after_classification
+        from agent.turn_retry_state import TurnRetryState
+
+        class _Agent:
+            log_prefix = ""
+            api_mode = "chat_completions"
+            provider = "custom"
+            model = "gpt-5.5"
+            base_url = "http://relay.example/v1"
+            tools = [{
+                "type": "function",
+                "function": {
+                    "name": "send",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"email": {"type": "string", "pattern": r"^(?!no-reply).+@.+$"}},
+                    },
+                },
+            }]
+
+            def _recover_with_credential_pool(self, **kwargs):
+                return False, False
+
+            def __getattr__(self, name):
+                return lambda *args, **kwargs: None
+
+        e = MockAPIError(
+            "Invalid JSON schema: regex lookaround is not supported. Found at $.properties.email.pattern.",
+            status_code=400,
+        )
+        classified = classify_api_error(e, provider="custom", model="gpt-5.5")
+        assert classified.reason == FailoverReason.llama_cpp_grammar_pattern
+        agent = _Agent()
+        retry_now, _ = recover_after_classification(
+            agent, e, classified, TurnRetryState(),
+            status_code=400, error_context=None, messages=[], api_messages=[],
+        )
+        assert retry_now is True
+        assert "pattern" not in agent.tools[0]["function"]["parameters"]["properties"]["email"]
+        # A generic schema 400 without the lookaround sentence stays a plain client error.
+        other = classify_api_error(
+            MockAPIError("Invalid JSON schema: regex syntax error in pattern", status_code=400), provider="custom"
+        )
+        assert other.reason != FailoverReason.llama_cpp_grammar_pattern
+
     def test_qwen_apply_prompt_template_no_user_query_not_llama_cpp_grammar(self):
         """Local engines wrap Qwen raise_exception as applyPromptTemplate 400.
 
@@ -1131,6 +1180,28 @@ class TestClassifyApiError:
             "Malformed message array 400" in r.getMessage()
             for r in caplog.records
         ), "Expected a distinct warning identifying the malformed-body 400"
+
+    def test_400_top_level_detail_body_is_not_a_bare_400_on_large_session(self):
+        """FastAPI-style ``{"detail": "..."}`` bodies (Codex gateway, Starlette relays) →
+        the descriptive text is read, so the large-session heuristic does not route a
+        model entitlement/retirement rejection into compression (#81558, #106475).
+        ``str(error)`` is the SDK's ``Error code: 400 - {...}`` form, exactly as on the wire.
+        Salvaged from #100783 (@i-Hun)."""
+        detail = "The 'gpt-5.5-codex' model is not supported when using Codex with a ChatGPT account."
+        large = dict(provider="openai-codex", model="gpt-5.5-codex",
+                     approx_tokens=109_962, context_length=272_000, num_messages=223)
+        for body in ({"detail": detail}, {"detail": {"message": detail}}):
+            e = MockAPIError(f"Error code: 400 - {body!r}", status_code=400, body=body)
+            result = classify_api_error(e, **large)  # type: ignore[arg-type]
+            assert result.reason is not FailoverReason.context_overflow, body
+            assert result.should_compress is False
+            assert result.should_fallback is True
+            assert result.message == detail
+        # Control: the genuinely bare body the heuristic exists for still compresses.
+        bare = classify_api_error(
+            MockAPIError("Error code: 400 - {'error': {'message': 'Error'}}", status_code=400,
+                         body={"error": {"message": "Error"}}), **large)  # type: ignore[arg-type]
+        assert bare.reason is FailoverReason.context_overflow
 
 
     # ── Peer closed + large session ──

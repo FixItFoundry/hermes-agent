@@ -141,7 +141,9 @@ def _print_switch_summary(cli, result, old_model, *, one_turn: bool, strict_cont
             raise
         ctx = None
     if ctx:
-        _cprint(f"    Context: {ctx:,} tokens")
+        from agent.context_pin import context_pin_suffix
+        _cprint(f"    Context: {ctx:,} tokens"
+                f"{context_pin_suffix(ctx, getattr(agent, '_config_context_length', None) if agent else None)}")
     if mi:
         if mi.max_output:
             _cprint(f"    Max output: {mi.max_output:,} tokens")
@@ -356,9 +358,10 @@ class CLIModelSwitchMixin:
 
         # 2. Replace untouched default with a Codex model
         if self._model_is_default:
-            fallback_model = "gpt-5.3-codex"
+            from hermes_cli.codex_models import DEFAULT_CODEX_MODELS, get_codex_model_ids
+
+            fallback_model = DEFAULT_CODEX_MODELS[0]
             try:
-                from hermes_cli.codex_models import get_codex_model_ids
                 available = get_codex_model_ids(access_token=self.api_key if self.api_key else None)
                 if available:
                     fallback_model = available[0]

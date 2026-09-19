@@ -768,9 +768,12 @@ def _provider_special_cases(c: _Ctx) -> Optional[Verdict]:
     # retry loop strips them. Exclude the Qwen/vLLM "No user query found" error
     # local engines wrap as "Unable to generate parser for this template" —
     # that is a poisoned transcript (→ format_error), not a grammar problem.
+    # Strict OpenAI-compatible schema validators reject regex lookaround in ``pattern``
+    # with a different sentence ("Invalid JSON schema: regex lookaround is not supported",
+    # #42631); same recovery — strip ``pattern``/``format`` and retry once.
     grammar_hit = "error parsing grammar" in msg or "json-schema-to-grammar" in msg or (
         "unable to generate parser" in msg and "template" in msg
-    )
+    ) or ("invalid json schema" in msg and "regex lookaround" in msg and "not supported" in msg)
     if status == 400 and grammar_hit and _NO_USER_QUERY_SIGNAL not in msg:
         return _v(_R.llama_cpp_grammar_pattern)
     # xAI Grok entitlement as an SSE ``type=error`` frame: no status, matches no
@@ -1254,12 +1257,18 @@ def _build_error_msg(error: Exception, body: Any) -> str:
 
 
 def _body_message_candidates(body: dict) -> Iterator[Any]:
-    """Body message fields in priority order (OpenAI, flat, litellm/Bedrock proxy shapes)."""
+    """Body message fields in priority order (OpenAI, flat, litellm/Bedrock proxy, FastAPI shapes)."""
     yield _error_obj(body).get("message")
     yield body.get("message")
     yield body.get("errorMessage")
     args = body.get("errorArgs")
     yield args.get("reason") if isinstance(args, dict) else None
+    # FastAPI/Starlette relays and the Codex gateway answer {"detail": "..."} (or a nested
+    # OpenAI-ish object); without it a descriptive rejection reads as a bare 400 and the
+    # large-session heuristic sends it into compression (#81558). A list here is pydantic's
+    # validation shape, read by _oversized_message_content_rejection.
+    detail = body.get("detail")
+    yield detail.get("message") if isinstance(detail, dict) else detail if isinstance(detail, str) else None
 
 
 def _from_cause_chain(error: Exception, pick: Callable[[Any], Any], default: Any) -> Any:

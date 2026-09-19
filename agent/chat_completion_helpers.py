@@ -518,27 +518,6 @@ def _estimate_chunk_bytes(chunk: Any) -> int:
     return size
 
 
-def _codex_wait_notice_recovery(*, stale_timeout: float, ttfb_enabled: bool, ttfb_timeout: float,
-    last_event_ts: Optional[float], last_progress_ts: Optional[float],
-    retry_started_ts: Optional[float], call_start: float, idle_enabled: bool,
-    idle_timeout: float, idle_requires_progress: bool, elapsed: float) -> str:
-    """Describe the earliest enabled Codex watchdog on the call timeline."""
-    deadlines: list[float] = []
-    if math.isfinite(stale_timeout):
-        deadlines.append(stale_timeout)
-    if retry_started_ts is not None:
-        if ttfb_enabled and math.isfinite(ttfb_timeout):
-            deadlines.append(max(0.0, retry_started_ts - call_start) + ttfb_timeout)
-    elif last_event_ts is None:
-        if ttfb_enabled and math.isfinite(ttfb_timeout):
-            deadlines.append(ttfb_timeout)
-    elif (not idle_requires_progress or last_progress_ts is not None) and idle_enabled and math.isfinite(idle_timeout):
-        deadlines.append(max(0.0, last_event_ts - call_start) + idle_timeout)
-    if not deadlines or min(deadlines) <= elapsed:
-        return ""
-    return f"; auto-reconnect at {int(min(deadlines))}s"
-
-
 # ── Cross-turn stale-call circuit breaker (#58962) ─────────────────────
 # A session wedged against an unresponsive provider would otherwise hit the
 # stale detector on every call forever. ``agent._consecutive_stale_streams``
@@ -1258,11 +1237,17 @@ def _reasoning_config_for_wire(agent):
         # The route rejects disables. Resend exactly what the session has
         # been sending — the user's own config — so the retry lands on the
         # same provider cache key as every prior request. Only a config that
-        # is itself a disable is dropped (omitted → route default), and that
-        # session has never sent anything else, so nothing warm is lost.
+        # is itself a disable changes, and that session has never sent
+        # anything else, so nothing warm is lost: a route that said the
+        # disable is *mandatory-on* gets the floor effort (closest to what
+        # the user asked for); a relay that does not know the field gets
+        # nothing (route default).
         if isinstance(cfg, dict) and (
             cfg.get("enabled") is False or cfg.get("effort") == "none"
         ):
+            if getattr(agent, "_reasoning_floor_required", False):
+                from agent.auxiliary_reasoning_floor import REASONING_FLOOR_EFFORT
+                return {**cfg, "enabled": True, "effort": REASONING_FLOOR_EFFORT}
             return None
         return cfg
     if ephemeral_off:
@@ -1730,9 +1715,19 @@ def _fallback_api_mode_hint(fb: dict, fb_provider: str, fb_base_url_hint: Option
     rewrites a dual-surface /anthropic base to /v1, losing the Anthropic wire signal. An explicit
     ``api_mode`` always wins (even "chat_completions") and suppresses later re-detection;
     ``provider: anthropic`` without a base_url still resolves to anthropic_messages."""
-    explicit = str(fb.get("api_mode") or "").strip()
+    from hermes_cli.runtime_provider import _get_named_custom_provider, _parse_api_mode
+    # Entries accept the same ``api_mode`` / ``transport`` spellings as ``providers.<name>``.
+    explicit = _parse_api_mode(fb.get("api_mode") or fb.get("transport"))
     if explicit:
         return True, explicit
+    # A named ``providers.<name>`` block declares its wire once (``api_mode``/``transport``); a
+    # fallback entry naming that provider inherits it instead of being re-detected from the host
+    # (#33062, #81932: an Anthropic-Messages or Responses-only relay on a plain host was downgraded
+    # to chat_completions while resolve_provider_client had already built the declared client).
+    if fb_provider and fb_provider not in {"custom", "moa"}:
+        declared = (_get_named_custom_provider(fb_provider) or {}).get("api_mode")
+        if declared:
+            return True, declared
     if fb_provider == "anthropic" or (fb_base_url_hint and _is_anthropic_wire_url(fb_base_url_hint)):
         return False, "anthropic_messages"
     return False, "chat_completions"
@@ -1802,6 +1797,23 @@ def _fallback_chain_exhausted(agent, reason: "FailoverReason | None") -> bool:
     return False
 
 
+def _candidate_pool_exhausted(agent, fb_provider: str, fb_model: str) -> bool:
+    """True when every credential the candidate would use sits in an exhaustion cooldown longer
+    than the retry loop's longest wait (the 600s Retry-After cap): switching to it only fails the
+    turn the same way the primary just did (#89401). A short throttle still gets its chance."""
+    pool = getattr(agent, "_credential_pool", None)
+    if pool is None or (getattr(pool, "provider", "") or "").strip().lower() != fb_provider:
+        try:
+            from agent.credential_pool import load_pool
+            pool = load_pool(fb_provider)
+        except Exception:
+            return False
+    if pool is None or not pool.has_credentials() or pool.has_available(model=fb_model):
+        return False
+    until = pool.next_available_at(model=fb_model)
+    return until is None or until - time.time() > 600
+
+
 def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set) -> bool:
     """True when the entry is already unavailable, malformed, locally unusable, or resolves
     to the backend that just failed (falling back to it would loop the failure)."""
@@ -1813,6 +1825,9 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
     from agent.fallback_cooldown import _is_entitlement_rejected
     if _is_entitlement_rejected(agent, fb_provider, fb_model):
         logger.info("Fallback skip: %s/%s was rejected as unentitled for this account", fb_provider, fb_model)
+        return True
+    if _candidate_pool_exhausted(agent, fb_provider, fb_model):
+        logger.warning("Fallback skip: %s/%s credential pool is exhausted (every entry in cooldown)", fb_provider, fb_model)
         return True
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
@@ -2042,7 +2057,11 @@ _EMPTY_SUMMARY_RESPONSE = "I reached the iteration limit and couldn't generate a
 
 def _iteration_summary_api_messages(agent, messages: list) -> list:
     """Wire-ready messages for the summary call, mirroring the main loop's api_messages build
-    (sidecar substitution, tool-call repair, thinking-only drop, underscore-key sweep)."""
+    (sidecar substitution, tool-call repair, thinking-only drop, underscore-key sweep).
+
+    ``reasoning_details`` is kept: the anthropic_messages converter rebuilds signed thinking
+    blocks from it, and the chat-completions transport already drops it on the wire for routes
+    that do not replay it (``_chat_summary_attempt`` -> ``_build_api_kwargs``)."""
     needs_sanitize = agent._should_sanitize_tool_calls()
     sanitize_model = agent.model
     if needs_sanitize and agent.provider == "moa":
@@ -2817,6 +2836,26 @@ class _StreamingCall(StreamingWaitMonitor):
         self.agent._stream_diag_capture_response(self.clients.diag, response)
         self.agent._check_openrouter_cache_status(response)
         self._writer_token = claim_stream_writer(self.agent)
+        self._reabort_if_cancelled(response)
+
+    def _reabort_if_cancelled(self, response: Any) -> None:
+        """Interrupt/stale abort that raced ``create()``: the one-shot pool sweep ran while
+        the connect/TLS window held no socket yet (``tcp_force_closed=0``), so nothing stopped
+        the request once it came up and the serve kept generating into a dropped consumer
+        (#98974). Response headers prove the socket exists now — shut it down (shutdown-only,
+        never a cross-thread close) so the worker unwinds as after a stale kill."""
+        with self.stream_attempt_lock:
+            current = int(self.stream_attempt_state["current"])
+            cancelled = self._request_cancelled["value"] or current in self.stream_attempt_state["cancelled"]
+        if not cancelled:
+            return
+        self._shutdown_stale_attempt_socket(response)
+        if self._attempt_request_client is not None:
+            # Kind-aware: the anthropic_messages wire (incl. anthropic-compatible custom endpoints)
+            # runs on a request-local Anthropic client with its own slot sweep.
+            abort = (self.agent._abort_request_anthropic_client if self.agent.api_mode == "anthropic_messages"
+                     else self.agent._abort_request_openai_client)
+            abort(self._attempt_request_client, reason="cancelled_attempt_late_connect")
 
     def _accept_chat_chunk(self, stream_attempt_id: int, chunk: Any) -> bool:
         with contextlib.suppress(Exception):
@@ -2930,6 +2969,10 @@ class _StreamingCall(StreamingWaitMonitor):
                 usage_obj = chunk.usage
 
             reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+            # Same ``model_extra`` fallback as the non-streaming path: a reasoning-only stream
+            # whose deltas carry only this field otherwise trips the empty-stream guard (#56516).
+            if reasoning_text is None and isinstance(getattr(delta, "model_extra", None), dict):
+                reasoning_text = delta.model_extra.get("reasoning_content") or delta.model_extra.get("reasoning")
             if reasoning_text:
                 # Summary-part models omit the separator between markdown blocks; re-insert it.
                 reasoning_text = separate_glued_reasoning_blocks(
@@ -3001,6 +3044,8 @@ class _StreamingCall(StreamingWaitMonitor):
         message = getattr(choices[0] if isinstance(choices, (list, tuple)) and choices else None, "message", None)
         if message is not None:
             reasoning_text = getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None)
+            if reasoning_text is None and isinstance(getattr(message, "model_extra", None), dict):
+                reasoning_text = message.model_extra.get("reasoning_content") or message.model_extra.get("reasoning")
             if isinstance(reasoning_text, str) and reasoning_text:
                 self._emit_reasoning(reasoning_text)
             content = getattr(message, "content", None)
@@ -3118,7 +3163,8 @@ class _StreamingCall(StreamingWaitMonitor):
         saw_stream_event = False
         self.last_chunk_time["t"] = time.time()
         _diag = self._new_diag()
-        self._writer_token = None
+        self._writer_token = self._attempt_stream_response = None
+        self._attempt_request_client = request_client
         _stream_context = {"manager": None, "stream": None}
         base_final_message = None
 
@@ -3135,10 +3181,13 @@ class _StreamingCall(StreamingWaitMonitor):
 
         def _anthropic_stream_created(raw_stream: Any) -> None:
             _stream_context["stream"] = raw_stream
+            # Same wiring as the chat_completions wire: MessageStream exposes the httpx response,
+            # so the interrupt/stale abort can shut down THIS attempt's socket (#98974).
+            response = self._attempt_stream_response = getattr(raw_stream, "response", None)
             # Snapshot response diagnostics now so they survive a stream dying before the first event.
-            self._quiet(
-                lambda: self.agent._stream_diag_capture_response(_diag, getattr(raw_stream, "response", None)))
+            self._quiet(lambda: self.agent._stream_diag_capture_response(_diag, response))
             self._writer_token = claim_stream_writer(self.agent)
+            self._reabort_if_cancelled(response)
 
         stream = self._set_managed_stream(relay_llm.stream(self.api_kwargs, _open_anthropic_stream,
             **_relay_stream_identity(self.agent, "anthropic"), finalizer=accumulator.finalize,
@@ -3463,10 +3512,14 @@ class _StreamingCall(StreamingWaitMonitor):
         # transport error as a cancel, not a network error (#6600).
         self._request_cancelled["value"] = True
         logger.debug("Force-closing streaming httpx client due to interrupt (not a network error).")
+        # Same as the stale kill: the pool sweep can miss the connection checked out for the
+        # in-flight body read, so shut down the attempt's own socket too (#98974).
+        _killed_response = self._attempt_stream_response
         with contextlib.suppress(Exception):
             self._cancel_current_stream_attempt("stream_interrupt_abort")
             # Kind-aware: only the request-local socket; the shared _anthropic_client is never closed here.
             self.clients.close_once("stream_interrupt_abort")
+        self._shutdown_stale_attempt_socket(_killed_response)
         # Let the worker unwind Relay-managed scopes first; raising first lets
         # turn teardown race a still-open scope and corrupt the LIFO stack.
         if self.worker is not None:

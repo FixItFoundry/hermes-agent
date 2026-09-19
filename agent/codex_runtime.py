@@ -57,6 +57,43 @@ def _codex_request_failure_details(error: BaseException) -> tuple[int | None, st
     return request_body_bytes, " <- ".join(exception_classes)
 
 
+def _prune_zero_event_retry_payload(api_kwargs: dict, attempt: int, attempts: int) -> dict:
+    """#95429 criterion 3: a reconnect after an attempt that produced no stream event must not resend
+    a pathological payload unchanged. Inline ``function_call_output`` strings over the per-result
+    threshold (results that escaped commit-time persistence) are spilled through the standard
+    policy -- bounded preview + recoverable ``<persisted-output>`` reference -- and ONE log line
+    records the size delta. When nothing is prunable the resend is logged as unchanged. The
+    caller's kwargs are never mutated; only the retried wire payload changes."""
+    from tools.budget_config import DEFAULT_BUDGET
+    from tools.tool_result_storage import maybe_persist_tool_result
+
+    items = api_kwargs.get("input")
+    if not isinstance(items, list):
+        return api_kwargs
+    before = len(json.dumps(items, default=str).encode("utf-8"))
+    if before <= DEFAULT_BUDGET.turn_budget:
+        return api_kwargs
+    pruned_items, pruned = [], 0
+    for item in items:
+        output = item.get("output") if isinstance(item, dict) and item.get("type") == "function_call_output" else None
+        if isinstance(output, str):
+            replaced = maybe_persist_tool_result(content=output, tool_name="codex_zero_event_retry",
+                                                 tool_use_id=str(item.get("call_id") or "call"),
+                                                 config=DEFAULT_BUDGET, threshold=DEFAULT_BUDGET.default_result_size)
+            if replaced != output:
+                item, pruned = {**item, "output": replaced}, pruned + 1
+        pruned_items.append(item)
+    if not pruned:
+        logger.warning("Codex zero-event retry (attempt %s/%s): no prunable tool output; resending payload "
+                       "unchanged (serialized_input_bytes=%s, model=%s)", attempt, attempts, before, api_kwargs.get("model"))
+        return api_kwargs
+    after = len(json.dumps(pruned_items, default=str).encode("utf-8"))
+    logger.warning("Codex zero-event retry (attempt %s/%s): spilled %d oversized tool output(s) before reconnect, "
+                   "serialized_input_bytes=%s -> %s (model=%s)", attempt, attempts, pruned, before, after,
+                   api_kwargs.get("model"))
+    return {**api_kwargs, "input": pruned_items}
+
+
 def _coerce_usage_int(value: Any) -> int:
     if isinstance(value, bool):
         return 0
@@ -107,9 +144,14 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
                             counts=lambda: billing(billing_mode="subscription_included"))
         return {}
     from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+    # ``inputTokens`` is INCLUSIVE of ``cachedInputTokens`` (same contract as the Responses API, see
+    # normalize_usage's codex_responses branch); CanonicalUsage.prompt_tokens re-adds cache_read on top of
+    # input_tokens, so the canonical input bucket must be the UNCACHED remainder or cached tokens count twice.
+    cache_read_tokens = _coerce_usage_int(usage.get("cachedInputTokens"))
     canonical_usage = CanonicalUsage(
-        input_tokens=_coerce_usage_int(usage.get("inputTokens")), output_tokens=_coerce_usage_int(usage.get("outputTokens")),
-        cache_read_tokens=_coerce_usage_int(usage.get("cachedInputTokens")), cache_write_tokens=0,
+        input_tokens=max(0, _coerce_usage_int(usage.get("inputTokens")) - cache_read_tokens),
+        output_tokens=_coerce_usage_int(usage.get("outputTokens")),
+        cache_read_tokens=cache_read_tokens, cache_write_tokens=0,
         reasoning_tokens=_coerce_usage_int(usage.get("reasoningOutputTokens")), raw_usage=usage,
     )
     prompt_tokens = canonical_usage.prompt_tokens
@@ -337,6 +379,11 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if isinstance(text, str) and text.strip() and getattr(agent, "show_commentary", True):
             agent_cb("_emit_interim_assistant_message", "_emit_interim_assistant_message raised",
                      args=({"role": "assistant", "content": text},))
+        # Each agentMessage item is its own delivered message: the completed item was just compared
+        # against ITS deltas, so drop them before the next item's deltas arrive. Otherwise the buffer
+        # holds "commentary + final", the final agentMessage no longer prefix-matches, and it is
+        # re-delivered with already_streamed=False as a second copy (#74248 boundary 2).
+        agent._current_streamed_assistant_text = ""
 
     def _on_item(params: dict, completed: bool) -> None:
         item = params.get("item")
@@ -388,6 +435,8 @@ def _ensure_codex_session(agent) -> None:
         return
     from agent.runtime_cwd import resolve_agent_cwd
     from agent.transports.codex_app_server_session import CodexAppServerSession, _ServerRequestRouting
+    from hermes_cli.codex_runtime_switch import get_configured_codex_binary
+    from hermes_cli.config import load_config
     # Approval callback: Hermes' standard prompt flow when a CLI thread installed one.
     approval_callback = None
     with suppress(Exception):
@@ -408,6 +457,7 @@ def _ensure_codex_session(agent) -> None:
     # narrower item/started-only bridge from #38835.
     agent._codex_session = CodexAppServerSession(
         cwd=getattr(agent, "session_cwd", None) or str(resolve_agent_cwd()), approval_callback=approval_callback,
+        codex_bin=get_configured_codex_binary(load_config()),
         request_routing=_ServerRequestRouting(auto_approve_exec=auto_approve_requests, auto_approve_apply_patch=auto_approve_requests),
         on_event=make_codex_app_server_event_bridge(agent),
     )
@@ -998,6 +1048,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     else "Codex Responses stream transport failed mid-iteration (attempt %s/%s); retrying. %s error=%s",
                     attempt + 1, max_stream_retries + 1, agent._client_log_context(), exc,
                 )
+                if not intercepted_events:  # zero-event attempt: never resend a pathological payload silently
+                    api_kwargs = _prune_zero_event_retry_payload(api_kwargs, attempt + 1, max_stream_retries + 1)
                 continue
             except RuntimeError:
                 # "No terminal response"; Relay may still hold a finalizer-assembled response.

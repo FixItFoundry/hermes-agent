@@ -541,8 +541,10 @@ DEFAULT_CONFIG = {
         # above 0.75 to override the floor.
         "threshold": 0.50,
         # threshold_tokens: absolute token cap — compression triggers at the lower of the ratio
-        # threshold and this count. Clamped to the model's context length.
-        "threshold_tokens": None,
+        # threshold and this count. Clamped to the model's context length. 256K bounds 1M-window
+        # models (their 50% trigger sat at 500K, so compaction never fired) while every lower
+        # ratio trigger still wins; null = ratio-only.
+        "threshold_tokens": 256_000,
         # "progress_notices": False,    # opt-in (#52995): when True, routine compression
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         # tail_mode: "lean" = clamped 2.5%-of-window tail (10K floor / 25K cap) plus chunked
@@ -707,8 +709,11 @@ DEFAULT_CONFIG = {
         # OpenAI-compatible request fields. Vision: download_timeout = image HTTP download (s).
         "vision": _aux(120, download_timeout=30),
         # web_extract and session_search no longer use an aux LLM; leftover blocks in user config
-        # are ignored. Compression: raise timeout for local models.
-        "compression": _aux(120),
+        # are ignored. Compression: raise timeout for local models. no_progress_timeout
+        # (Codex/Responses streams only): seconds without a substantive event before the stream
+        # fails fast; None = built-in 60s default. Independent of "timeout" (the overall request
+        # budget) — raising "timeout" alone does not widen this window. See #108104.
+        "compression": _aux(120, no_progress_timeout=None),
         "skills_hub": _aux(30),
         "approval": _aux(30),   # classifier — a fast/cheap model is recommended
         # /review reviewer: a full subagent on the async delegation rail, credentials resolved like
@@ -1275,10 +1280,10 @@ DEFAULT_CONFIG = {
         "request_overrides": {},
         # compression_threshold_tokens: optional absolute cap on a subagent's compaction TRIGGER
         # (not the request payload), applied as the lower of this and the child's ratio threshold.
-        # 0 (default) = no subagent-specific cap; children compact at the same 0.50 x window as the
-        # parent (500K on a 1M model). A replay of a 1,393-agent run showed 200K-400K caps within
-        # 5% of each other in cost once cache prefixes are intact, and every compaction is a
-        # chance to lose detail, so the default stays off. A token count >= 16000 enables it;
+        # 0 (default) = no subagent-specific cap; children compact where the parent does — the lower
+        # of 0.50 x window and the global compression.threshold_tokens cap. A replay of a 1,393-agent
+        # run showed 200K-400K caps within 5% of each other in cost once cache prefixes are intact,
+        # and every compaction is a chance to lose detail, so the default stays off. A token count >= 16000 enables it;
         # other values (true, "200k") are config errors: warned and ignored.
         "compression_threshold_tokens": 0,
         # When delegate_task narrows child toolsets, keep the parent's enabled MCP toolsets (so
@@ -1306,6 +1311,10 @@ DEFAULT_CONFIG = {
         # Orchestrator role controls. Depth floored at 1, no ceiling; each level multiplies cost.
         "max_spawn_depth": 1,  # 1 = flat, 2 = orchestrator→leaf, 3+ = deeper
         "orchestrator_enabled": True,  # kill switch for role="orchestrator"
+        # Total subagents a finite one-shot run (hermes chat -q / --oneshot) may spawn; 0 = unlimited.
+        # Each child re-pays a cold system prompt and re-explores the repo, and one-shot spawns are mostly
+        # "review my own work" rather than parallel work (agent/oneshot_footprint.py).
+        "oneshot_max_children": 2,
         # Subagent threads ALWAYS resolve approvals non-interactively (the parent TUI owns stdin;
         # input() from a worker would deadlock). false = auto-deny, true = auto-approve "once"; both
         # log a warning audit line. true only for trusted batch work.
@@ -1423,17 +1432,19 @@ DEFAULT_CONFIG = {
         # aux-model cost. `hermes curator run --consolidate` overrides once.
         "consolidate": False,
         # Also prune bundled built-ins (a suppression list stops `hermes update` restoring them);
-        # hub-installed skills are NEVER pruned. A built-in's clock starts when the curator first
-        # sees it, so never a mass-prune on the first run. false = keep all.
-        "prune_builtins": True,
+        # hub-installed skills are NEVER pruned. OFF by default: shipped skills vanishing from
+        # `skills_list` because nobody loaded them for 30 days surprised people (57 gone in one
+        # startup tick). true = built-ins age out like agent-created skills.
+        "prune_builtins": False,
         # TTL purge of skills/.archive/: 0 = never; > 0 lets the explicit `hermes curator purge`
         # delete older archived skills (never automatic; logged in the ledger).
         "archive_ttl_days": 0,
-        # Before every real (non-dry-run) pass, snapshot ~/.hermes/skills/ to
-        # ~/.hermes/skills/.curator_backups/<utc-iso>/skills.tar.gz (`hermes curator rollback`).
+        # Before a consolidation pass (the only one that rewrites skill content in place), snapshot
+        # ~/.hermes/skills/ to ~/.hermes/skills/.curator_backups/<utc-iso>/skills.tar.gz (`hermes curator
+        # rollback`). The prune-only pass just moves directories into .archive/ and takes none.
         "backup": {
             "enabled": True,
-            "keep": 5,  # retain last N regular snapshots
+            "keep": 2,  # retain last N regular snapshots
         },
     },
     # Honcho AI-native memory — ~/.honcho/config.json is the source of truth (apiKey, workspace,
@@ -1459,6 +1470,9 @@ DEFAULT_CONFIG = {
         "free_response_channels": "",  # comma-separated channel IDs answered without mention
         "allowed_channels": "",  # if set, ONLY respond in these channel IDs (whitelist)
         "auto_thread": True,  # auto-create threads on @mention in channels (like Slack)
+        # Free-response channels reply inline by default; true also gives each top-level
+        # message in them its own thread (still mention-free). Env: DISCORD_FREE_RESPONSE_AUTO_THREAD.
+        "free_response_auto_thread": False,
         "thread_require_mention": False,  # require @mention in threads too (multi-bot threads)
         # Bot authors must type @thisbot to trigger a reply; Discord reply pings alone do not count.
         # Set False only for trusted legacy relays. Humans are unaffected.
@@ -2250,6 +2264,11 @@ DEFAULT_CONFIG = {
         # Missing server binaries: auto = install via npm/go/pip into <HERMES_HOME>/lsp/bin/ on
         # first use; manual = only binaries on PATH; off = alias for manual.
         "install_strategy": "auto",
+        # Node package manager for the npm-recipe servers: npm | pnpm | yarn. Installs still land in
+        # <HERMES_HOME>/lsp/node_modules; a configured manager that is not installed, or an unknown
+        # value, skips the install (no silent fallback to npm) so a pnpm/yarn supply-chain policy is
+        # never bypassed.
+        "package_manager": "npm",
         # Idle seconds before a server is shut down (respawned on demand), so long- running
         # processes don't accumulate stale children (hundreds of MB + pipe FDs each) across
         # worktrees. 0 = keep servers for process lifetime.
@@ -2257,6 +2276,9 @@ DEFAULT_CONFIG = {
         # Per-server overrides keyed by registry server_id (pyright, gopls...): disabled: true;
         # command: ["path/to/server", "--stdio"] (bypasses auto- install); env: {...};
         # initialization_options: {...} (merged into LSP initializationOptions).
+        # A key that is NOT a built-in id declares a custom server (matched before the built-ins):
+        # command: ["my-ls", "--stdio"]; extensions: [".ext"]; optional root_markers: [...],
+        # language_id: "..." (didOpen languageId), description: "...". Manual install only.
         "servers": {},
     },
     # X (Twitter) Search via xAI's x_search Responses tool. Registers when xAI creds exist

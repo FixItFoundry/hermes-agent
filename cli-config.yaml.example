@@ -643,14 +643,12 @@ compression:
   #   "claude-sonnet": 0.35
   #   "gpt-5": 0.30
 
-  # Optional absolute token cap for the compression trigger (default: null = disabled).
-  # When set, compression fires at the LOWER of the ratio-based threshold and this
-  # absolute token count — first-fires-wins. It never fires later than this count
-  # regardless of which model is active (useful when switching between models with
-  # very different context windows). Clamped to the model's context length at
-  # apply-time, so a cap above the window is a no-op (ratio-based threshold wins).
-  # Survives model switches and fallback activations.
-  # threshold_tokens: 200000
+  # Absolute token cap for the compression trigger (default: 256000).
+  # Compression fires at the LOWER of the ratio-based threshold and this count,
+  # bounding large-window sessions while lower proportional triggers still win
+  # whenever they fall below the cap. The cap survives model switches and fallbacks.
+  # Set null to restore ratio-only behavior.
+  threshold_tokens: 256000
 
   # Existing Codex gpt-5.5 behavior: raise Hermes' compaction trigger to 85%
   # for the ChatGPT Codex OAuth route. Set false to opt back down to threshold.
@@ -915,6 +913,12 @@ prompt_caching:
 #     provider: "auto"
 #     model: ""
 #     # max_concurrency: 2    # Optional: cap simultaneous compression calls
+#     # no_progress_timeout: 60   # Codex/Responses-only: seconds a stream may go without a
+#                                 # substantive event before it fails fast (default: 60).
+#                                 # Independent of "timeout" above (the overall request
+#                                 # budget) — raising "timeout" alone does not widen this
+#                                 # window. Each substantive event re-arms it; a slow but
+#                                 # progressing reasoning/summary stream is not affected.
 #
 #   # Post-turn memory/skill self-improvement review fork. Runs after a turn
 #   # when the nudge intervals fire; writes skills/memories in a daemon thread.
@@ -1223,12 +1227,17 @@ agent:
   # Reasoning effort level (OpenRouter and Nous Portal)
   # Controls how much "thinking" the model does before responding.
   # Options: "xhigh" (max), "high", "medium", "low", "minimal", "none" (disable)
+  # Providers with bespoke thinking tiers (a relay serving fast/thinking): use the
+  # dict form and the level is sent verbatim. Bare strings stay strict (typo guard).
+  #   reasoning_effort:
+  #     enabled: true
+  #     effort: thinking
   reasoning_effort: "medium"
   
   # Per-model reasoning effort overrides (optional dict)
   # Key: any sensible model spelling works (exact, dots↔dashes interchangeable,
   #      provider prefix optional). First match wins.
-  # Value: reasoning effort level (same options as reasoning_effort)
+  # Value: reasoning effort level (same options as reasoning_effort, dict form included)
   # Override the global reasoning_effort for that specific model.
   # NOTE: no `hermes config set` support for this key -- edit YAML directly.
   # reasoning_overrides:
@@ -1397,6 +1406,7 @@ platform_toolsets:
 #   require_mention: true            # Require @mention in server channels (default: true)
 #   bots_require_inline_mention: true  # Bot authors must type a literal @mention (default: true)
 #   auto_thread: true                # Auto-create thread on @mention (default: true)
+#   free_response_auto_thread: false # Free-response channels also auto-thread (default: reply inline)
 #   free_response_channels: ""       # Channel IDs where no mention is needed
 #   reactions: true                  # Show processing reactions (default: true)
 #   history_backfill: true           # Recover missed channel messages on mention (default: true)

@@ -1997,6 +1997,31 @@ def test_interim_commentary_is_not_marked_already_streamed_without_callbacks(mon
     }
 
 
+def test_app_server_bridge_commentary_then_final_agent_messages_are_each_already_streamed(monkeypatch):
+    """#74248 boundary 2: codex app-server emits commentary deltas + completed, then final deltas +
+    completed. The completed final must compare against ITS OWN deltas, not "commentary + final", or
+    it is re-delivered with already_streamed=False and the gateway posts a second copy."""
+    from agent.codex_runtime import make_codex_app_server_event_bridge
+
+    agent = _build_agent(monkeypatch)
+    agent.stream_delta_callback = lambda text: None
+    deliveries = []
+    agent.interim_assistant_callback = lambda text, *, already_streamed=False: deliveries.append(
+        (text, already_streamed)
+    )
+    on_event = make_codex_app_server_event_bridge(agent)
+
+    def _agent_message(item_id, text, phase):
+        on_event({"method": "item/agentMessage/delta", "params": {"itemId": item_id, "delta": text}})
+        on_event({"method": "item/completed", "params": {
+            "item": {"id": item_id, "type": "agentMessage", "text": text, "phase": phase}}})
+
+    _agent_message("m1", "Checking the config.", "commentary")
+    _agent_message("m2", "Native compaction is active.", "final_answer")
+
+    assert deliveries == [("Checking the config.", True), ("Native compaction is active.", True)]
+    assert agent._current_streamed_assistant_text == ""
+
 
 
 def test_interim_content_was_streamed_matches_prefix_not_exact(monkeypatch):
@@ -2199,6 +2224,26 @@ def test_dump_api_request_debug_uses_chat_completions_url(monkeypatch, tmp_path)
 
     payload = json.loads(dump_file.read_text(encoding="utf-8"))
     assert payload["request"]["url"] == "http://127.0.0.1:9208/v1/chat/completions"
+
+
+def test_dump_api_request_debug_reads_the_anthropic_client_and_messages_url(monkeypatch, tmp_path):
+    """anthropic_messages keeps its SDK client on ``_anthropic_client`` (``client`` is None):
+    the dump must show the masked key and /messages, not 'Bearer None' + /chat/completions (#24293)."""
+    import json
+    from types import SimpleNamespace
+    agent = _build_agent(monkeypatch)
+    agent.api_mode = "anthropic_messages"
+    agent.base_url = "https://relay.example.com/anthropic"
+    agent.client = None
+    agent._anthropic_client = SimpleNamespace(api_key="sk-ant-api03-abcdefghijklmnopqrstuvwxyz")
+    agent.logs_dir = tmp_path
+
+    dump_file = agent._dump_api_request_debug({"model": "claude", "messages": []}, reason="preflight")
+
+    payload = json.loads(dump_file.read_text(encoding="utf-8"))
+    assert payload["request"]["url"] == "https://relay.example.com/anthropic/messages"
+    assert "None" not in payload["request"]["headers"]["Authorization"]
+    assert "abcdefghijklmnopqrstuvwxyz" not in payload["request"]["headers"]["Authorization"]
 
 
 

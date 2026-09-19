@@ -24,7 +24,8 @@ from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_res
 from agent.think_scrubber import THINK_TAG_NAMES
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import (
-    STATUS_EXHAUSTED, credential_pool_matches_provider, resolve_runtime_pool_key
+    STATUS_EXHAUSTED, credential_pool_entry_serves_endpoint, credential_pool_matches_provider,
+    resolve_runtime_pool_key,
 )
 from agent.error_classifier import FailoverReason
 from agent.retry_utils import parse_retry_after_seconds, reset_delay_from_message
@@ -851,6 +852,14 @@ def recover_with_credential_pool(
         next_entry = pool.mark_exhausted_and_rotate(**kwargs)
         if next_entry is None:
             return False
+        if not credential_pool_entry_serves_endpoint(next_entry, getattr(agent, "base_url", None)):
+            # Mixed same-provider pool (#68237): the entry serves another endpoint and _swap_credential
+            # would rebind this session to it. Treat as no recovery, like a rotation that yields nothing.
+            _ra().logger.info(
+                "Credential %s (%s) — pool entry %s serves another endpoint; not swapping",
+                rotate_status, label, getattr(next_entry, "id", "?"),
+            )
+            return False
         _ra().logger.info(
             "Credential %s (%s) — rotated to pool entry %s",
             rotate_status, label, getattr(next_entry, "id", "?"),
@@ -897,6 +906,11 @@ def recover_with_credential_pool(
             pool, has_retried_429=has_retried_429, error_context=error_context,
             api_key_hint=api_key_hint, credential_id=credential_id, rotate_and_swap=_rotate_and_swap,
         )
+    if effective_reason == FailoverReason.model_entitlement:
+        # The pool benches (credential, model) only and hands back the next entry that is not
+        # benched for this model; None once every entry rejected it, so the caller falls
+        # through to the single-credential handling in _mark_entitlement_rejected_model (#71970).
+        return _rotate_and_swap(400, "model entitlement"), has_retried_429
     if effective_reason == FailoverReason.auth:
         return _recover_auth_failure(
             agent, pool, status_code=status_code, has_retried_429=has_retried_429,
@@ -1323,11 +1337,17 @@ def dump_api_request_debug(
     try:
         body = {k: v for k, v in copy.deepcopy(api_kwargs).items() if v is not None and k != "timeout"}
         api_key = None
+        # anthropic_messages keeps its SDK client on ``_anthropic_client`` (``client`` is None):
+        # read the key from there so the dump does not say "Bearer None" (#24293).
+        anthropic = agent.api_mode == "anthropic_messages"
         try:
-            api_key = getattr(agent.client, "api_key", None)
+            live = getattr(agent, "_anthropic_client", None) if anthropic else agent.client
+            api_key = getattr(live, "api_key", None) or getattr(live, "auth_token", None)
         except Exception as e:
             _ra().logger.debug("Could not extract API key for debug dump: %s", e)
-        endpoint = "/responses" if agent.api_mode == "codex_responses" else "/chat/completions"
+        endpoint = {"codex_responses": "/responses", "anthropic_messages": "/messages"}.get(
+            agent.api_mode, "/chat/completions"
+        )
         dump_payload: Dict[str, Any] = {
             "timestamp": datetime.now().isoformat(), "session_id": agent.session_id, "reason": reason,
             "request": {

@@ -37,6 +37,9 @@ Your request
   → 401 auth expired?
       → Try refreshing the token (OAuth)
       → Refresh failed → rotate to next pool key
+  → 400 "model is not supported when using Codex with a ChatGPT account"?
+      → Bench this key for that model only, rotate to the next key (other models stay usable)
+      → Every key rejects the model → fallback_model; the model is skipped for the session
   → Success → continue normally
 ```
 
@@ -122,7 +125,7 @@ Type [1/2]:
 | `hermes auth add <provider> --priority 0` | Add a credential and place it first in the `fill_first` order |
 | `hermes auth priority <provider> <target> <n>` | Move a credential to priority `n` (0 = tried first); the rest are renumbered |
 | `hermes auth remove <provider> <index>` | Remove credential by 1-based index |
-| `hermes auth reset <provider>` | Clear all cooldowns/exhaustion status |
+| `hermes auth reset <provider>` | Clear all cooldowns/exhaustion status (applies to running sessions too: a live gateway or chat picks the reset up on its next request instead of writing its stale cooldown back) |
 | `hermes auth reset <provider> <target>` | Clear the cooldown on one credential by index, id, or label |
 | `hermes auth refresh <provider> [target]` | Refresh one OAuth credential's tokens and return it to rotation (proves the grant is alive; the next request re-checks quota) |
 
@@ -175,6 +178,7 @@ The pool handles different errors differently:
 | **429 Rate Limit** | Retry same key once (transient). Second consecutive 429 rotates to next key | 1 hour |
 | **402 Billing/Quota** | Immediately rotate to next key | 1 hour |
 | **401 Auth Expired** | Try refreshing the OAuth token first. Rotate only if refresh fails | 5 minutes |
+| **400 Codex model entitlement** (`The '<model>' model is not supported when using Codex with a ChatGPT account.`) | Bench this key for the rejected model only and rotate to the next key; other models keep using the key. Other 400s never rotate | Until `hermes auth reset` (per model; an entitlement is a plan property, not a window) |
 | **All keys exhausted** | Fall through to `fallback_model` if configured | — |
 
 Provider-supplied `reset_at` timestamps override these default cooldowns.

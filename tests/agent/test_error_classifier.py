@@ -9,6 +9,7 @@ from agent.error_classifier import (
     FailoverReason,
     PROVIDER_STREAM_NON_JSON_ERROR_CODE,
     classify_api_error,
+    is_reasoning_field_rejection,
     _extract_status_code,
     _extract_error_body,
     _extract_error_code,
@@ -59,7 +60,7 @@ class TestFailoverReason:
     def test_enum_members_exist(self):
         expected = {
             "auth", "auth_permanent", "billing", "rate_limit",
-            "upstream_rate_limit",
+            "upstream_rate_limit", "upstream_blocked",
             "overloaded", "server_error", "timeout",
             "ssl_cert_verification",
             "context_overflow", "payload_too_large", "image_too_large",
@@ -70,6 +71,7 @@ class TestFailoverReason:
             "reasoning_mandatory",
             "provider_policy_blocked",
             "content_policy_blocked",
+            "model_entitlement",
             "thinking_signature", "long_context_tier",
             "oauth_long_context_beta_forbidden",
             "llama_cpp_grammar_pattern",
@@ -206,6 +208,16 @@ class TestClassifyApiError:
         result = classify_api_error(e, provider="anthropic")
         assert result.reason == FailoverReason.auth
         assert result.should_fallback is True
+
+    def test_403_upstream_unavailable_code_is_transient_not_auth(self):
+        """A gateway 403 stamped ``code=upstream_unavailable`` is a transient upstream
+        outage: retried with backoff, credential untouched (#75388)."""
+        body = {"error": {"message": "Upstream service temporarily unavailable. Please retry later.",
+                          "type": "upstream_unavailable", "code": "upstream_unavailable"}}
+        result = classify_api_error(MockAPIError("Forbidden", status_code=403, body=body), provider="custom")
+        assert result.reason == FailoverReason.overloaded
+        assert result.retryable is True
+        assert result.should_rotate_credential is False
 
 
 
@@ -858,6 +870,27 @@ class TestClassifyApiError:
         e = MockAPIError("Error code: 400 - " + body["message"], status_code=400, body=body)
         assert classify_api_error(e, provider=provider, model="gpt-5.5").reason == expected
 
+    @pytest.mark.parametrize(("provider", "body", "expected"), [
+        ("openai-codex", {"detail": "Unsupported content type"}, FailoverReason.invalid_encrypted_content),
+        # Some SDK paths surface only the wrapped message text, no parsed body.
+        ("openai-codex", None, FailoverReason.invalid_encrypted_content),
+        ("openai", {"detail": "Unsupported content type"}, FailoverReason.format_error),  # elsewhere a genuine shape 400
+    ], ids=["codex-dict-body", "codex-message-only", "other-provider"])
+    def test_codex_unsupported_content_type_detail_reaches_replay_strip(self, provider, body, expected):
+        """#51512: the ChatGPT Codex backend rejects a replayed encrypted-reasoning item as a bare
+        ``{"detail": "Unsupported content type"}`` 400; only the codex provider maps it to the replay strip."""
+        e = MockAPIError("Error code: 400 - {'detail': 'Unsupported content type'}", status_code=400, body=body)
+        assert classify_api_error(e, provider=provider, model="gpt-5.5").reason == expected
+
+    def test_thinking_signature_invalid_uses_encrypted_replay_recovery(self):
+        """#70595: the OpenAI code contains "thinking" + "signature", so it must beat the Anthropic
+        thinking-block heuristic and reach the one-shot encrypted-replay strip (retry, no fallback)."""
+        body = {"error": {"code": "thinking_signature_invalid", "message": "The reasoning signature is no longer valid."}}
+        e = MockAPIError(f"Error code: 400 - {body}", status_code=400, body=body)
+        result = classify_api_error(e, provider="openai", model="gpt-5.5")
+        assert result.reason == FailoverReason.invalid_encrypted_content
+        assert result.retryable is True and result.should_fallback is False
+
     @pytest.mark.parametrize(("provider", "model", "message", "code"), [
         ("azure-foundry", "gpt-6-astra", "Conflicting authenticated continuation identities.", "invalid_value"),
         # Custom Responses endpoint wraps the replay rejection in a generic bad_request (#95834).
@@ -908,6 +941,19 @@ class TestClassifyApiError:
             provider="custom", model="kimi-k2-thinking",
         )
         assert gated.reason != FailoverReason.reasoning_mandatory
+
+    def test_openai_unsupported_none_effort_body_is_reasoning_mandatory(self):
+        """OpenAI's real 400 for ``reasoning.effort: none`` on a model whose ladder has no ``none`` (o3/o4-mini,
+        gpt-5/gpt-5-codex; ``none`` is gpt-5.1+): the SDK message carries the body — ``param: reasoning.effort``
+        plus ``code: unsupported_value`` — and must take the drop-the-disable retry rung, not a format abort."""
+        body = {"error": {"message": "Unsupported value: 'none' is not supported with this model. Supported values "
+                                     "are: 'low', 'medium', and 'high'.",
+                          "type": "invalid_request_error", "param": "reasoning.effort", "code": "unsupported_value"}}
+        msg = f"Error code: 400 - {body}"
+        assert is_reasoning_field_rejection(msg)
+        result = classify_api_error(MockAPIError(msg, status_code=400, body=body), provider="openai-api", model="o4-mini")
+        assert result.reason == FailoverReason.reasoning_mandatory
+        assert result.retryable is True and result.should_fallback is False
 
     # ── Provider-specific: llama.cpp grammar-parse ──
 
@@ -1016,6 +1062,15 @@ class TestClassifyApiError:
 
 
 
+    def test_message_account_id_token_extraction_failure_is_auth(self):
+        """Codex 'Failed to extract accountId from token' without a status is an
+        auth failure: no retry on the same credential, rotate, fall back (#72911)."""
+        e = Exception("Failed to extract accountId from token")
+        result = classify_api_error(e, provider="openai-codex")
+        assert result.reason == FailoverReason.auth
+        assert result.retryable is False
+        assert result.should_rotate_credential is True
+        assert result.should_fallback is True
 
 
     # ── Message-only usage limit disambiguation (no status code) ──
@@ -1347,6 +1402,43 @@ class TestSSLCertVerificationFailFast:
 
 
 # ── Test: RateLimitError without status_code (Copilot/GitHub Models) ──────────
+
+class TestProviderCodeOnlyErrors:
+    """Bare ``{"error": {"code": …}}`` bodies with no HTTP status map to the
+    provider's structured reason instead of ``unknown`` (#70414)."""
+
+    @pytest.mark.parametrize("provider, code, reason", [
+        ("gemini", "UNAVAILABLE", FailoverReason.overloaded),
+        ("google", "DEADLINE_EXCEEDED", FailoverReason.timeout),
+        ("vertex", "INTERNAL", FailoverReason.server_error),
+        ("anthropic", "API_ERROR", FailoverReason.server_error),
+        ("openai-codex", "SERVER_ERROR", FailoverReason.server_error),
+    ])
+    def test_provider_native_code_maps_to_structured_reason(self, provider, code, reason):
+        e = MockAPIError(code, body={"error": {"code": code}})
+        result = classify_api_error(e, provider=provider)
+        assert result.reason == reason
+        assert result.retryable is True
+        assert result.should_rotate_credential is False
+
+    def test_code_meaning_does_not_leak_across_providers(self):
+        e = MockAPIError("UNAVAILABLE", body={"error": {"code": "UNAVAILABLE"}})
+        assert classify_api_error(e, provider="openai").reason == FailoverReason.unknown
+
+    def test_gemini_wire_body_numeric_code_falls_back_to_status(self):
+        """Gemini's real body carries the HTTP status in ``error.code`` and the
+        symbolic code in ``error.status``; the numeric code must not shadow it."""
+        body = {"error": {"code": 503, "status": "UNAVAILABLE", "message": "Service unavailable."}}
+        e = MockAPIError("Service unavailable.", body=body)
+        assert classify_api_error(e, provider="gemini").reason == FailoverReason.overloaded
+
+    def test_anthropic_rate_limit_error_code_rotates_credential(self):
+        e = MockAPIError("rate limited", body={"error": {"code": "rate_limit_error"}})
+        result = classify_api_error(e, provider="anthropic")
+        assert result.reason == FailoverReason.rate_limit
+        assert result.should_rotate_credential is True
+        assert result.should_fallback is True
+
 
 class TestRateLimitErrorWithoutStatusCode:
     """Regression tests for the Copilot/GitHub Models edge case where the

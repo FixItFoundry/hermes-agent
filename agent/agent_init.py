@@ -1059,6 +1059,9 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
         enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
     )
+    # A finite -q run has no later session to learn for: no skill authoring tool (agent/oneshot_footprint.py).
+    from agent.oneshot_footprint import prune_oneshot_tools
+    agent.tools = prune_oneshot_tools(agent.tools or [])
 
     agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools} if agent.tools else set()
     # Kanban guidance is session-static for the dispatcher-owned worker only. Profiles may
@@ -2089,7 +2092,9 @@ def _emit_compression_summary(agent, cs):
             # The active engine's own threshold — a plugin's differs from cs.threshold.
             _pct = getattr(_cc, "threshold_percent", cs.threshold)
             _cap = getattr(_cc, "threshold_tokens_cap", None)
-            _cap_note = f" (capped at {_cap:,} tokens)" if _cap and _cap > 0 else ""
+            # Name the cap only when it is what set the trigger; on small windows the ratio already sits below it.
+            _cap_binds = bool(_cap) and _cap > 0 and _cc.threshold_tokens == min(_cap, _cc.context_length)
+            _cap_note = f" (capped at {_cap:,} tokens)" if _cap_binds else ""
             print(f"📊 Context limit: {_cc.context_length:,} tokens (compress at {int(_pct*100)}% = {_cc.threshold_tokens:,}{_cap_note})")
         else:
             print(f"📊 Context limit: {_cc.context_length:,} tokens (auto-compression disabled)")

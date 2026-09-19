@@ -62,7 +62,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 
 Both built-in OpenCode providers send an opaque, per-conversation `x-opencode-session` header on every request (main turns on every transport plus auxiliary calls such as compression, titles, approval checks, skills-hub lookups and `/btw` side questions — including the ones that run in the background after the turn has ended; headless Kanban `specify`/`decompose` and dashboard estimate calls use a per-task key). OpenCode uses it to pin a conversation to one backend so its prompt cache stays warm; the value is derived from the Hermes session id (or the Kanban task id) and carries no personal data.
 
-The two built-in OpenCode providers each pin their own relay on `opencode.ai` (`opencode-zen` → `/zen/v1`, `opencode-go` → `/zen/go/v1`). A `model.base_url` left behind by the other relay is healed to the selected provider's relay, and the model you pick (`-m`, `/model`, a fallback entry or a channel override) decides which relay is used — so switching from a Zen model to a Go-only one never sends the request to Zen. A custom provider you define under `providers:` whose name extends a family slug (for example `opencode-go-bridge`) still gets the family's per-model API-mode routing and `/v1` handling, but its `base_url` is taken as declared: name it after the relay it actually points at.
+The two built-in OpenCode providers each pin their own relay on `opencode.ai` (`opencode-zen` → `/zen/v1`, `opencode-go` → `/zen/go/v1`). A `model.base_url` left behind by the other relay is healed to the selected provider's relay, and the model you pick (`-m`, `/model`, a fallback entry or a channel override) decides which relay is used — so switching from a Zen model to a Go-only one never sends the request to Zen. A custom provider you define under `providers:` whose name extends a family slug (for example `opencode-go-bridge`) still gets the family's per-model API-mode routing and `/v1` handling, but its `base_url` is taken as declared: name it after the relay it actually points at. Auxiliary tasks (`auxiliary.compression`, titles, vision, MoA) pointed at an OpenCode provider follow the same per-model table, so a Responses-only model such as `gpt-5.6-luna` or an Anthropic-wire one such as `minimax-m2.5` works there exactly as it does for the main conversation.
 
 For the official API-key path, see the dedicated [Google Gemini guide](../guides/google-gemini.md).
 
@@ -1676,8 +1676,10 @@ fallback_providers:
   - provider: anthropic
     model: claude-sonnet-4
     # base_url: http://localhost:8000/v1    # optional, for custom endpoints
-    # api_mode: chat_completions           # optional override
+    # api_mode: chat_completions           # optional override (`transport:` is an accepted alias)
 ```
+
+An entry that names a `providers.<name>` block (`provider: my-relay` or `provider: custom:my-relay`) inherits that block's `transport` / `api_mode` when the entry sets none, so a Responses-only or Anthropic-Messages relay keeps its declared wire on fallback. Set `api_mode` on the entry to override it.
 
 The legacy single-pair `fallback_model:` dict is still accepted for back-compat:
 

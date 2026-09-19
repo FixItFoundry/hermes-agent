@@ -26,8 +26,19 @@ logger = logging.getLogger(__name__)
 
 def _translate_acp_cwd(cwd: str) -> str:
     """Translate Windows ACP cwd values (``E:\\Projects``, ``\\\\wsl.localhost\\``) to POSIX form
-    when Hermes runs in WSL so agents, tools, and persisted sessions agree; no-op elsewhere."""
-    return translate_cwd_for_wsl_backend(str(cwd))
+    when Hermes runs in WSL so agents, tools, and persisted sessions agree; no-op elsewhere.
+
+    A client-declared cwd that is not an existing directory is dropped (empty string) instead of
+    being registered: the terminal applies the session cwd with ``cd`` BEFORE the command line,
+    so one dead path makes every later call in the session fail (Rabbit's R1 ``rabbit-agent``
+    ships its build-machine default ``/home/yt``, which does not exist here). Callers ignore an
+    empty cwd, so the session keeps the working directory it actually has.
+    """
+    translated = translate_cwd_for_wsl_backend(str(cwd))
+    if translated and not os.path.isdir(os.path.expanduser(translated)):
+        logger.warning("Ignoring ACP session cwd that is not a directory: %s", translated)
+        return ""
+    return translated
 
 
 def _normalize_cwd_for_compare(cwd: str | None) -> str:

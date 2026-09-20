@@ -626,6 +626,14 @@ def _apply_profile_override() -> None:
 
 
 _apply_profile_override()
+# ``-p``/active_profile re-homed the process after hermes_bootstrap ran: re-point the temp vars
+# at THIS home's scratch dir (a user-set TMPDIR is still left alone).
+try:
+    from hermes_constants import export_scratch_tmp_env as _export_scratch_tmp_env
+
+    _export_scratch_tmp_env()
+except Exception:
+    pass  # an unwritable home leaves the system temp dir in place; never block startup
 
 # Windows launcher self-heal — the ``hermes`` command is a COPY of the venv
 # console script staged into the managed bin dir (outside the checkout, since
@@ -739,6 +747,8 @@ from hermes_cli.model_setup_flows import (
     _model_flow_anthropic,
     _model_flow_moa,
     _model_flow_ai_gateway,
+    _model_flow_plugin_provider,
+    _is_profile_plugin_flow_provider,
 )
 logger = logging.getLogger(__name__)
 from hermes_cli.main_agent_cmds import (
@@ -2094,6 +2104,9 @@ def select_provider_and_model(args=None):
     # _model_flow_* names at call time so test monkeypatches on
     # hermes_cli.main keep intercepting.
     flow = _PROVIDER_MODEL_FLOWS.get(selected_provider)
+    if flow is None and _is_profile_plugin_flow_provider(selected_provider):
+        # Registered plugin profile with no bespoke flow: the generic one, keyed by its auth_type.
+        flow = lambda c, m, a: _model_flow_plugin_provider(c, selected_provider, m)  # noqa: E731
     if flow is not None:
         flow(config, current_model, args)
     elif (

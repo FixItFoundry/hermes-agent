@@ -478,7 +478,6 @@ def _finalize_routing(agent, api_mode, credential_pool):
         api_mode is None
         and agent.api_mode == "chat_completions"
         and not is_actual_route(agent.provider, agent.base_url)
-        and agent.provider != "copilot-acp"
         and not _base_lower.startswith(("acp://", "acp+tcp://"))
         and not agent._is_azure_openai_url()
         and (
@@ -792,9 +791,18 @@ def _explicit_client_kwargs(agent, api_key, base_url, _provider_timeout) -> Dict
         client_kwargs["default_query"] = {k: v[0] for k, v in parse_qs(_parsed_url.query).items()}
     if _provider_timeout is not None:
         client_kwargs["timeout"] = _provider_timeout
-    if agent.provider == "copilot-acp":
-        client_kwargs["command"] = agent.acp_command
-        client_kwargs["args"] = agent.acp_args
+    # ACP/subprocess providers take launch kwargs instead of HTTP credentials. Keyed on the
+    # provider profile's auth_type, not one vendor slug, so out-of-tree external_process
+    # plugin providers get the same launch path as the built-in copilot-acp (#102421).
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(agent.provider)
+        if profile is not None and profile.auth_type == "external_process":
+            client_kwargs["command"] = agent.acp_command
+            client_kwargs["args"] = agent.acp_args
+    except Exception as exc:
+        logger.debug("External-process launch kwargs unavailable for %s: %s", agent.provider, exc)
     _headers_for = _host_default_headers_factory(base_url)
     if _headers_for is not None:
         client_kwargs["default_headers"] = _headers_for(api_key, base_url)
@@ -1340,6 +1348,13 @@ def _apply_agent_section(agent, _agent_cfg):
     # "auto" (codex_responses only), true (all api_modes), false, or model substrings.
     agent._intent_ack_continuation = _agent_section.get("intent_ack_continuation", "auto")
 
+    # Responses `text.verbosity`: "" / unknown value = not sent (never flips the provider default).
+    _verbosity = str(_agent_section.get("text_verbosity") or "").strip().lower()
+    if _verbosity and _verbosity not in {"low", "medium", "high"}:
+        logger.warning("Unknown agent.text_verbosity %r; expected low, medium or high — ignoring", _verbosity)
+        _verbosity = ""
+    agent.text_verbosity = _verbosity or None
+
     # Default-on boolean gates: anti-stall guards (notice-only), universal guidance toggles
     # (ALL models, unlike enforcement), the local toolchain probe, Bot Mode protocol section.
     for _key in (
@@ -1365,6 +1380,12 @@ def _apply_agent_section(agent, _agent_cfg):
     except (TypeError, ValueError):
         _api_retries = 3
     agent._api_max_retries = _api_retries
+    # Bounded post-exhaustion auto-recovery cycles once retries AND the fallback chain are spent
+    # on a transient outage (agent/turn_recovery_autorecover.py). 0 disables the ladder.
+    try:
+        agent._auto_recovery_cycles = max(int(_agent_section.get("auto_recovery_cycles", 5)), 0)
+    except (TypeError, ValueError):
+        agent._auto_recovery_cycles = 5
 
 
 def _positive_int(raw: Any, *, reject: tuple = ()) -> Optional[int]:

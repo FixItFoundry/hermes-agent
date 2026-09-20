@@ -625,12 +625,14 @@ class _SummaryFailureKind:
     streaming_closed: bool
     empty_content: bool
     truncated: bool
+    overloaded: bool
 
     def fallback_reason(self) -> str:
         """Reason string for the one-shot main-model retry log line, most specific first."""
         reasons = (
             (self.json_decode, "returned invalid JSON"), (self.truncated, "returned a truncated summary (output token cap)"),
-            (self.empty_content, "returned empty content"), (self.model_not_found, "unavailable"),
+            (self.empty_content, "returned empty content"), (self.overloaded, "was overloaded"),
+            (self.model_not_found, "unavailable"),
             (self.streaming_closed, "closed stream prematurely"), (self.timeout, "timed out"),
         )
         return next((reason for flagged, reason in reasons if flagged), "failed")
@@ -657,6 +659,8 @@ def _classify_summary_failure(e: Exception) -> _SummaryFailureKind:
         ),
         # Truncated summary: one main-model retry, then ABORT preserving the session.
         truncated=isinstance(e, RuntimeError) and _TRUNCATED_SUMMARY_MARKER in err,
+        overloaded=classify_api_error(e).reason is FailoverReason.overloaded
+        or any(marker in err for marker in ("overloaded", "at capacity", "over capacity")),
     )
 
 
@@ -690,6 +694,13 @@ _TERMINAL_SUMMARY_FAILURES = (
         "Summary generation failed (LLM returned empty content) — aborting compression. %d message(s) "
         "preserved unchanged; the session was NOT rotated. This indicates upstream provider degradation: "
         "retry with /compress once the provider recovers, or continue the conversation as-is.",
+    ),
+    (
+        "_last_summary_overload_failure",
+        "summary_overload_failure",
+        "Summary generation failed because the provider is overloaded — aborting compression. %d message(s) "
+        "preserved unchanged; the session was NOT rotated. Retry with /compress once capacity recovers, "
+        "or continue the conversation as-is.",
     ),
 )
 
@@ -3811,6 +3822,8 @@ Write only the summary body. Do not include any preamble or prefix."""
             self._last_summary_truncated_failure = True
         elif kind.empty_content:
             self._last_summary_empty_content_failure = True
+        elif kind.overloaded:
+            self._last_summary_overload_failure = True
         logger.warning(
             "Failed to generate context summary: %s. Further summary attempts paused for %d seconds.", e,
             _transient_cooldown,
@@ -4224,22 +4237,29 @@ Write only the summary body. Do not include any preamble or prefix."""
         return idx
 
     @classmethod
+    def _is_real_user_turn(cls, message: Dict[str, Any]) -> bool:
+        """Actionable user turn that is not synthetic scaffolding — the row test both index scans share.
+
+        Weaker than ``agent.conversation_compression._is_real_user_message``, which also rejects
+        metadata-flagged scaffolding this pair cannot see; use that one when the question is
+        "is this a genuine inbound user message".
+        """
+        return cls._is_actionable_user_turn(message) and not cls._is_synthetic_compression_user_turn(message)
+
+    @classmethod
     def _real_user_indices_desc(cls, messages: List[Dict[str, Any]], head_end: int) -> list[int]:
         """Newest-first indices of actionable, non-synthetic user turns at or after *head_end* (no handoffs/blank echoes)."""
         return [
             i for i in range(len(messages) - 1, head_end - 1, -1)
-            if cls._is_actionable_user_turn(messages[i])
-            and not cls._is_synthetic_compression_user_turn(messages[i])
+            if cls._is_real_user_turn(messages[i])
         ]
 
     def _find_last_user_message_idx(self, messages: List[Dict[str, Any]], head_end: int) -> int:
         """Return the latest actionable user turn at or after *head_end*, or -1."""
-        # Early-exit generator: only the newest hit is needed, and this runs on every boundary
-        # computation — collecting every index (``_real_user_indices_desc``) costs a full scan.
+        # Early-exit generator: callers want the newest hit only, and collecting every index
+        # (``_real_user_indices_desc``) costs a full backward scan per call.
         return next(
-            (i for i in range(len(messages) - 1, head_end - 1, -1)
-             if self._is_actionable_user_turn(messages[i])
-             and not self._is_synthetic_compression_user_turn(messages[i])),
+            (i for i in range(len(messages) - 1, head_end - 1, -1) if self._is_real_user_turn(messages[i])),
             -1,
         )
 
@@ -4402,9 +4422,7 @@ Write only the summary body. Do not include any preamble or prefix."""
             return compressed
 
         for msg in compressed[carrier_idx + 1:]:
-            if self._is_actionable_user_turn(
-                msg
-            ) and not self._is_synthetic_compression_user_turn(msg):
+            if self._is_real_user_turn(msg):
                 # A real request already follows the summary.
                 return compressed
 
@@ -5170,7 +5188,7 @@ def split_user_originated_turn(message: Any) -> tuple[Optional[Dict[str, Any]], 
             candidate["display_metadata"] = durable_metadata
     drop_stale_api_content(candidate)
     cls = ContextCompressor
-    if cls._is_synthetic_compression_user_turn(candidate) or not cls._is_actionable_user_turn(candidate):
+    if not cls._is_real_user_turn(candidate):
         return handoff, None
     return handoff, candidate
 
@@ -5247,10 +5265,7 @@ def reference_handoff_would_drive_next_model_call(messages: Optional[List[Dict[s
         role = message.get("role")
         if (
             role == "tool" or (role == "assistant" and message.get("tool_calls"))
-            or (
-                ContextCompressor._is_actionable_user_turn(message)
-                and not ContextCompressor._is_synthetic_compression_user_turn(message)
-            )
+            or ContextCompressor._is_real_user_turn(message)
             or (is_compaction_summary_message(message) and _handoff_carries_live_user_content(message))
         ):
             return False

@@ -187,8 +187,8 @@ gateway:
     choice_normal: "normal — standard processing"
     choice_auto: "auto — fast for the first seconds of every turn"
     choice_cold: "cold — fast for the first turn of a session only"
-    choice_ultrafast: "ultrafast — OpenAI Ultrafast (GPT-6 Astra, 6x price)"
-    ultrafast_not_supported: "⚡ Ultrafast is only available for GPT-6 Astra (current model: `{model}`)."
+    choice_ultrafast: "ultrafast — OpenAI Ultrafast, 6x price"
+    ultrafast_not_supported: "⚡ Ultrafast isn't available for `{model}` on this account or route."
   footer:
     status: "📎 Runtime footer: **{state}**\nFields: `{fields}`\nPlatform: `{platform}`"
     usage: "Usage: `/footer [on|off|status]`"
@@ -797,6 +797,9 @@ gateway:
   plan:
     ack_task: "Planning: {task}"
     ack_conversation: "Planning from this conversation's context…"
+
+  initiate_setup:
+    ack: "Starting setup…"
 
   init:
     start_failed: "Could not start /init — please try again."
@@ -1627,6 +1630,8 @@ slash:
     description: "Re-run a prompt on a recurring interval in this session"
   plan:
     description: "Write a markdown implementation plan to .hermes/plans/ without executing anything"
+  initiate-setup:
+    description: "Run the first-run setup: learn about you and set Hermes up around you"
   moa:
     description: "Run one prompt through the default Mixture of Agents preset, then restore your model"
   subgoal:
@@ -2375,6 +2380,7 @@ cli:
     failed: "Connection failed"
     authorized_no_tools: "Authorized. Tools unavailable."
     connected: "Connected"
+    named_account: "Hermes named this {name} account {alias}. Rename it anytime."
     waiting: "Waiting…"
   editor:
     only_interactive: "External editor is only available inside the interactive CLI."
@@ -2756,7 +2762,7 @@ cli:
       feature_anthropic: "Anthropic Fast Mode"
       feature_openai: "Priority Processing"
       feature_ultrafast: "OpenAI Ultrafast"
-      ultrafast_not_supported: "(._.) Ultrafast is only available for GPT-6 Astra (current model: {model})."
+      ultrafast_not_supported: "(._.) Ultrafast isn't available for {model} on this account or route."
       usage: "Usage: /fast [normal|fast|auto|cold|ultrafast|status] [--global]"
       status: "{feature}: {status}"
       set_to: "✓ {feature} set to {value} {scope}"
@@ -3014,6 +3020,8 @@ cli:
     plan:
       planning: "📋 Planning: {task}"
       from_conversation: "📋 Planning from this conversation's context..."
+    initiate_setup:
+      starting: "🧭 Starting setup..."
     init:
       updating: "⚡ Updating AGENTS.md from a project scan..."
       generating: "⚡ Generating AGENTS.md from a project scan..."

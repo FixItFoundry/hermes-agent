@@ -42,7 +42,7 @@ def strip_proxy_headers(request):
     headers, separator, body = request.partition(b'\r\n\r\n')
     lines = [
         line for line in headers.split(b'\r\n')
-        if not line.lower().startswith((b'proxy-', b'proxy-connection:'))
+        if not line.lower().startswith(b'proxy-')
     ]
     return b'\r\n'.join(lines) + separator + body
 
@@ -172,17 +172,23 @@ def forward_https(conn, host, port, request):
     # Two pumps run concurrently: client->upstream (new requests) and
     # upstream->client (responses). Each ends when its peer EOFs or errors;
     # when either side finishes, the whole tunnel is torn down.
+    conn.settimeout(UPSTREAM_IDLE_SECONDS)
     context = ssl.create_default_context(cafile=str(REAL_CA))
     upstream = None
     # A transient upstream connect/TLS failure looks like "empty reply" to the
     # client, which reads as a broken installer rather than a network blip.
     # Retry the handshake a few times before giving up on this tunnel.
     for attempt in range(3):
+        raw = None
         try:
             raw = socket.create_connection((host, port), timeout=UPSTREAM_IDLE_SECONDS)
             upstream = context.wrap_socket(raw, server_hostname=host)
             break
+        except socket.gaierror:
+            return
         except OSError:
+            if raw is not None:
+                raw.close()
             if attempt == 2:
                 return
             time.sleep(1)

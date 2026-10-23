@@ -196,6 +196,8 @@ if [ "$DEV_SANDBOX_INTERACTIVE" = true ]; then
   dev_mounts=(--dev /dev)
 fi
 
+# NODE_EXTRA_CA_CERTS appends to Node's built-in Mozilla roots rather than
+# replacing them, so point it at ca.pem so npm trusts the sandbox MITM CA.
 exec bwrap \
   --unshare-pid \
   --die-with-parent --proc /proc --tmpfs /tmp \

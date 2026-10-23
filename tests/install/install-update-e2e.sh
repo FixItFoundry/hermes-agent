@@ -279,6 +279,7 @@ fi
 if [ -n "$UV_INSTALLER_FIXTURE" ]; then
   UV_VER="$(grep -om1 'releases/download/[0-9][0-9.]*' "$UV_SCRIPT" | cut -d/ -f3)"
   if [ -n "$UV_VER" ]; then
+    # x86_64 matches current CI runners; arm64 silently falls back to upstream.
     _uv_rel="github/uv/releases/download/$UV_VER/uv-x86_64-unknown-linux-gnu.tar.gz"
     mkdir -p "$UV_FIXTURE_DIR/releases.astral.sh/$(dirname "$_uv_rel")" \
              "$UV_FIXTURE_DIR/github.com/astral-sh/$(dirname "${_uv_rel#github/}")"

@@ -1,0 +1,94 @@
+name: Sync upstream
+
+# Keeps fork `main` tracking NousResearch/hermes-agent.
+# Local installs run `hermes update`, which pulls FROM THIS FORK's main — so this
+# workflow is the only thing standing between "daily no-op update" and real code.
+#
+# Hourly, not daily: upstream lands ~1000 commits/day (1995 authors in a month).
+# Hourly keeps each merge ~40 commits instead of ~1000, so conflicts stay small
+# and reviewable.
+#
+# Never force-pushes. On conflict it opens/updates an issue and fails loudly, so
+# the fork can't silently drift for a month again.
+
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          # PAT (if configured) so the push re-triggers CI; GITHUB_TOKEN pushes
+          # do not start other workflows.
+          token: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name  "fork-sync-bot"
+          git config user.email "fork-sync-bot@users.noreply.github.com"
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch --no-tags upstream main
+
+      - name: Already up to date?
+        id: check
+        run: |
+          behind=$(git rev-list --count HEAD..upstream/main)
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          echo "upstream/main is $behind commit(s) ahead of fork main"
+
+      - name: Merge upstream/main
+        id: merge
+        if: steps.check.outputs.behind != '0'
+        run: |
+          if git merge --no-edit upstream/main; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            git merge --abort
+          fi
+
+      - name: Push merged main
+        if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflict == 'false'
+        run: |
+          git push origin HEAD:main
+          echo "Pushed; fork main now at $(git rev-parse --short HEAD)"
+
+      - name: Open issue on conflict
+        if: steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="Upstream sync blocked: merge conflict $(date -u +%Y-%m-%d)"
+          body=$(printf 'Hourly sync of `NousResearch/hermes-agent` → fork `main` hit a merge conflict.\n\nThe fork is **NOT** advancing until this is resolved. Local `hermes update` is therefore a no-op.\n\nReproduce:\n```\ngit fetch upstream main\ngit merge upstream/main\n```\n\nClose this issue once the sync workflow goes green.\n')
+          existing=$(gh issue list --repo "${{ github.repository }}" --state open --search "$title in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "${{ github.repository }}" --body "$body"
+          else
+            gh issue create --repo "${{ github.repository }}" --title "$title" --body "$body"
+          fi
+          exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Upstream sync"
+            echo "- behind at start: ${{ steps.check.outputs.behind }}"
+            echo "- conflict: ${{ steps.merge.outputs.conflict || 'n/a' }}"
+            echo "- fork main: \`$(git rev-parse --short HEAD)\`"
+          } >> "$GITHUB_STEP_SUMMARY"

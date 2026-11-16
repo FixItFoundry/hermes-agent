@@ -170,6 +170,7 @@ class SessionInventoryFields(Result):
     system_prompt: str | None = None
     context_length: int | None = None
     enabled_toolsets: list[str] | None = None
+    zero_tools: bool = False
     tool_availability: dict[str, JsonValue] | None = None
     # Classic CLI surface (``source: cli``) only: main's startup lines under the banner (Rich markup).
     tool_availability_warnings: list[str] | None = None

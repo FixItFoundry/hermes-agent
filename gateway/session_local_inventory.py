@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 
 logger = logging.getLogger(__name__)
@@ -140,11 +141,13 @@ def session_inventory(authority, policy, agent, cwd):
                   "update_behind": None, "update_command": "",
                   "branch": git_probe.branch(cwd) if cwd else "", "project": _project(cwd)}
     with owner_scope(authority):
+        tools_resolved = False
         config = policy.config(authority, secrets=False) if policy is not None else {}
         if agent is not None:
             from agent.voice_turn_route import session_runtime_view
             info["provider"] = _session_provider(session_runtime_view(agent), config if policy is not None else None)
             info["tools"] = _grouped(getattr(agent, "tools", None))
+            tools_resolved = True
             info["system_prompt"] = getattr(agent, "_cached_system_prompt", "") or ""
             compressor = getattr(agent, "context_compressor", None)
             if compressor is not None and getattr(compressor, "context_length", None):
@@ -157,9 +160,13 @@ def session_inventory(authority, policy, agent, cwd):
                 try:
                     enabled, tools = _policy_tools(policy, config)
                     info["tools"] = _grouped(tools)
+                    tools_resolved = True
                 except Exception:  # health: allow BLE001 -- main's suppress: the banner shows no tools, not an error
                     logger.warning("session inventory: tool snapshot failed", exc_info=True)
         info["enabled_toolsets"] = sorted(enabled)
+        info["zero_tools"] = bool(tools_resolved and policy is not None and not policy.toolsets and not enabled
+                                  and not info["tools"]
+                                  and json.loads(policy.request_json).get("toolsets") == ["no_mcp"])
         with contextlib.suppress(Exception):
             # The classic CLI banner colours lazy (yellow) / disabled (red) tools from this.
             from hermes_cli.banner import compute_toolset_availability

@@ -4871,6 +4871,7 @@ export interface CanonicalSessionInfo {
   system_prompt?: string | null
   context_length?: number | null
   enabled_toolsets?: string[] | null
+  zero_tools?: boolean
   tool_availability?: Record<string, unknown> | null
   tool_availability_warnings?: string[] | null
   unknown_toolsets?: string[] | null
@@ -5272,6 +5273,7 @@ export interface CanonicalSnapshotInfo {
   system_prompt?: string | null
   context_length?: number | null
   enabled_toolsets?: string[] | null
+  zero_tools?: boolean
   tool_availability?: Record<string, unknown> | null
   tool_availability_warnings?: string[] | null
   unknown_toolsets?: string[] | null

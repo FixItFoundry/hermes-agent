@@ -255,6 +255,8 @@ def _build_chat_parser(subparsers) -> argparse.ArgumentParser:
     inherited(chat_parser, "-m", "--model", default=SUPPRESS,
               help="Model to use (e.g., anthropic/claude-sonnet-4)")
     add("-t", "--toolsets", default=SUPPRESS, help="Comma-separated toolsets to enable")
+    add("--require-no-tools", action="store_true", default=False,
+        help="Refuse before sending a prompt unless the gateway confirms a tool-free session")
     inherited(chat_parser, "--reasoning", default=SUPPRESS, metavar="LEVEL", help=(
         "Reasoning effort for this session: none, minimal, low, medium, "
         "high, xhigh, max, or ultra. Overrides agent.reasoning_effort for "

@@ -10379,6 +10379,11 @@
             "default": null,
             "title": "Enabled Toolsets"
           },
+          "zero_tools": {
+            "default": false,
+            "title": "Zero Tools",
+            "type": "boolean"
+          },
           "tool_availability": {
             "anyOf": [
               {
@@ -11251,6 +11256,11 @@
             ],
             "default": null,
             "title": "Enabled Toolsets"
+          },
+          "zero_tools": {
+            "default": false,
+            "title": "Zero Tools",
+            "type": "boolean"
           },
           "tool_availability": {
             "anyOf": [

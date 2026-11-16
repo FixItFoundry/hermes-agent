@@ -159,6 +159,12 @@ async def _resume_latest(client, args):
                                  "or list sessions with `hermes sessions list`.") from None
 
 
+def require_tool_free_snapshot(snapshot):
+    info = snapshot.get("info") or {}
+    if info.get("zero_tools") is not True or info.get("enabled_toolsets") != [] or info.get("tools") != {}:
+        raise GatewayClientError("Gateway did not confirm a tool-free session; no prompt was sent")
+
+
 async def run_gateway_chat(args, emitter=None):
     from hermes_cli.gateway_chat_view import GatewayChatView
     query = getattr(args, "query", None) or getattr(args, "q", None)
@@ -223,6 +229,8 @@ async def run_gateway_chat(args, emitter=None):
             snapshot = await client.rpc("session.create", request_id=uuid.uuid4().hex, source=source, **policy)
             if (warning := (snapshot.get("info") or {}).get("config_warning")) and not isinstance(oneshot_prompt, str):
                 print(f"Warning: {warning}", file=sys.stderr)
+        if getattr(args, "require_no_tools", False):
+            require_tool_free_snapshot(snapshot)
         if not isinstance(oneshot_prompt, str):  # main's -z writes nothing to stderr on success
             print("Session: " + snapshot["stored_session_id"], file=sys.stderr, flush=True)
         if not oneshot:

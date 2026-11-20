@@ -24706,6 +24706,18 @@
               }
             ],
             "default": null
+          },
+          "paused": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Paused"
           }
         },
         "title": "MessageCompletePayload",
@@ -39586,6 +39598,18 @@
             ],
             "default": null,
             "title": "Expected Hosted Task Id"
+          },
+          "resume": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Resume"
           }
         },
         "required": [
